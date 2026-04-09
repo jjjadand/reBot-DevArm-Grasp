@@ -2,5 +2,6 @@ cameraws
 instructions.md
 Log
 data
-scripts
+scripts/*
+!scripts/main.py
 mobileclip2_b.ts
