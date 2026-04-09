@@ -1,0 +1,90 @@
+# ============================================================
+# 机械臂夹取感知系统 - 主配置文件
+# 修改 camera.type 来切换相机；其他参数按需调整
+# ============================================================
+
+camera:
+  # 相机类型：realsense_d435i | realsense_d405 | orbbec_gemini2
+  type: realsense_d435i
+  serial: null          # 设备序列号；null = 自动选择第一个
+  color_width: 1280
+  color_height: 720
+  depth_width: 1280
+  depth_height: 720
+  fps: 30
+
+calibration:
+  # 内参标定结果路径（由 scripts/run_intrinsic_calib.py 生成）
+  intrinsics_path: config/calibration/intrinsics.npz
+  # 手眼标定结果路径（由 scripts/collect_handeye_samples.py 生成）
+  hand_eye_path: config/calibration/hand_eye.npz
+
+  # 手眼模式：eye_in_hand（相机在末端）| eye_to_hand（相机固定）
+  mode: eye_in_hand
+
+  # 棋盘格参数（用于内参标定）
+  checkerboard:
+    cols: 9             # 内角点列数（物理10列格 → 9内角）
+    rows: 6             # 内角点行数
+    square_size_m: 0.025  # 每格边长（米）
+
+  # ArUco 标记参数（用于手眼标定）
+  aruco:
+    marker_length_m: 0.05   # 标记实际边长（米）
+    dict_id: 0              # 0 = DICT_4X4_50
+    target_marker_id: 0     # 目标标记 ID；null = 使用第一个检测到的
+
+  # 手眼标定算法：TSAI | PARK | HORAUD | ANDREFF | DANIILIDIS
+  hand_eye_method: TSAI
+
+detection:
+  # YOLOv11 权重文件（首次运行会自动下载 yolo11n.pt）
+  model_path: config/models/yolo11n.pt
+  conf_threshold: 0.5
+  iou_threshold: 0.45
+  device: null          # null = 自动（有 GPU 用 cuda:0，否则 cpu）
+  target_classes: null  # null = 检测所有类别；指定整数列表如 [0, 39] 只检测部分
+
+localization:
+  roi_radius: 3         # 深度采样 ROI 半径（3 → 7×7 中位数）
+  min_depth_m: 0.1      # 有效深度下限（米）
+  max_depth_m: 5.0      # 有效深度上限（米）
+
+yolo:
+  # ==========================================
+  # 模型选择库 (自动从 models/ 目录加载或下载)
+  # ==========================================
+  # 【全新 YOLO26 系列 (2026) - 原生无 NMS，极速部署】
+  # - "yolo26n.pt"         : 极致速度，默认识别 80 种 COCO 类别
+  # - "yoloe-26s-seg.pt"   : 开放词汇，输入文本找万物 (推荐，替代 YOLOv8-World)
+  # - "yoloe-26l-seg.pt"   : 开放词汇，高精度版本
+  #
+  # 【经典 YOLO 系列 (2023-2024)】
+  # - "yolov8s-world.pt"   : 经典开放词汇检测
+  # - "yolo11n.pt"         : 经典高精度 80 类检测
+  # ==========================================
+  model_name: "yolov8s-world.pt"
+  
+  # "cpu" 或 "cuda:0"
+  device: "cpu"
+  
+  # 是否开启开放词汇模式 (仅对 yolo-world 或 yoloe-26 模型有效)
+  use_world: true
+
+  custom_classes:
+    - "person"
+    - "laptop"
+    - "book"
+    - "monitor"
+    - "keyboard"
+    - "mouse"
+    - "chair"
+    - "table"
+    - "window"
+    - "door"
+    - "pen"
+    - "notebook"
+    - "laptop"
+    - "smartphone"
+    - "water bottle"
+    - "coffee cup"
