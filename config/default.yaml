@@ -30,7 +30,7 @@ calibration:
 
   # ArUco 标记参数（用于手眼标定）
   aruco:
-    marker_length_m: 0.05   # 标记实际边长（米）
+    marker_length_m: 0.1   # 标记实际边长（米）
     dict_id: 0              # 0 = DICT_4X4_50
     target_marker_id: 0     # 目标标记 ID；null = 使用第一个检测到的
 
@@ -72,7 +72,7 @@ yolo:
   # - "yolov8s-world.pt"   : 经典开放词汇检测
   # - "yolo11n.pt"         : 经典高精度 80 类检测
   # ==========================================
-  model_name: "yolov8s-world.pt"
+  model_name: "yolov8s-world.pt" 
   
   # "cpu" 或 "cuda:0"
   device: "cpu"
@@ -81,10 +81,6 @@ yolo:
   use_world: true
 
   custom_classes:
-    - "book"
-    - "mouse"
-    - "pen"
-    - "notebook"
-    - "smartphone"
+    - "yellow banana"
     - "water bottle"
     - "coffee cup"

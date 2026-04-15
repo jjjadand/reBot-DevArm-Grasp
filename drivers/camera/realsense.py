@@ -1,0 +1,135 @@
+"""Intel RealSense 相机驱动（D435i / D405 等）。"""
+from __future__ import annotations
+
+import numpy as np
+from pathlib import Path
+from typing import Optional, Tuple
+
+from .base import CameraDriver
+
+
+class RealsenseCamera(CameraDriver):
+    """Intel RealSense 深度相机驱动。
+
+    Args:
+        width, height, fps: 颜色流与深度流分辨率及帧率
+        calib_dir: 标定目录路径；含 intrinsics.npz 时从中读取畸变系数
+    """
+
+    def __init__(
+        self,
+        width: int = 1280,
+        height: int = 720,
+        fps: int = 30,
+        calib_dir: Optional[str] = None,
+    ) -> None:
+        self._w = width
+        self._h = height
+        self._fps = fps
+        self._calib_dir = Path(calib_dir) if calib_dir else None
+
+        self._pipeline = None
+        self._align = None
+        self._depth_scale_mm: float = 1.0   # raw uint16 → mm 的乘数
+        self._K: Optional[np.ndarray] = None
+        self._D: Optional[np.ndarray] = None
+        self._aruco = None
+
+    # ── 生命周期 ─────────────────────────────────────────────────────────────
+
+    def open(self) -> None:
+        try:
+            import pyrealsense2 as rs
+        except ImportError as e:
+            raise RuntimeError(f"未安装 pyrealsense2，请执行: pip install pyrealsense2: {e}") from e
+
+        pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.color, self._w, self._h, rs.format.bgr8, self._fps)
+        config.enable_stream(rs.stream.depth, self._w, self._h, rs.format.z16, self._fps)
+
+        try:
+            profile = pipeline.start(config)
+        except RuntimeError as e:
+            raise RuntimeError(
+                f"RealSense 相机未找到: {e}\n"
+                "  可能原因: 未插入 / USB 接口松动 / 被其他程序占用"
+            ) from e
+
+        self._pipeline = pipeline
+        self._align = rs.align(rs.stream.color)
+
+        # 内参
+        intr = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+        self._K = np.array([
+            [intr.fx, 0,        intr.cx],
+            [0,        intr.fy, intr.cy],
+            [0,        0,       1      ],
+        ], dtype=np.float64)
+
+        # 深度比例：raw uint16 * depth_scale (m/unit) * 1000 → mm
+        ds = profile.get_device().first_depth_sensor().get_depth_scale()
+        self._depth_scale_mm = ds * 1000.0
+
+        self._D = self._load_distortion()
+        print(f"[RealsenseCamera] 就绪 ({intr.width}×{intr.height}, "
+              f"depth_scale={ds:.6f} m/unit)")
+
+    def close(self) -> None:
+        if self._pipeline is not None:
+            try:
+                self._pipeline.stop()
+            except Exception:
+                pass
+            self._pipeline = None
+
+    # ── 帧获取 ───────────────────────────────────────────────────────────────
+
+    def get_frame(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        if self._pipeline is None:
+            return None, None
+        try:
+            frames = self._pipeline.wait_for_frames(500)
+            aligned = self._align.process(frames)
+            cf = aligned.get_color_frame()
+            df = aligned.get_depth_frame()
+            if not cf or not df:
+                return None, None
+
+            color_bgr = np.asanyarray(cf.get_data())
+            depth_raw = np.asanyarray(df.get_data())   # uint16, depth units
+            depth_mm  = (depth_raw * self._depth_scale_mm).astype(np.uint16)
+            return color_bgr, depth_mm
+        except Exception:
+            return None, None
+
+    # ── 内参 ─────────────────────────────────────────────────────────────────
+
+    @property
+    def K(self) -> np.ndarray:
+        if self._K is None:
+            raise RuntimeError("相机未打开，请先调用 open()")
+        return self._K
+
+    @property
+    def D(self) -> np.ndarray:
+        if self._D is None:
+            raise RuntimeError("相机未打开，请先调用 open()")
+        return self._D
+
+    # ── 内部 ─────────────────────────────────────────────────────────────────
+
+    def _load_distortion(self) -> np.ndarray:
+        if self._calib_dir is not None:
+            npz_path = self._calib_dir / "intrinsics.npz"
+            if npz_path.exists():
+                try:
+                    data = np.load(str(npz_path))
+                    D = data["dist_coeffs"].flatten()
+                    if abs(D[0]) > 5.0:
+                        print(f"[RealsenseCamera] 畸变系数 k1={D[0]:.2f} 偏大，改用零畸变")
+                        return np.zeros((1, 5), dtype=np.float64)
+                    return D.reshape(1, -1)
+                except Exception:
+                    pass
+        return np.zeros((1, 5), dtype=np.float64)
