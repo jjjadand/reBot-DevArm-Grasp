@@ -2,7 +2,8 @@
 Eye-in-Hand 手眼标定 — 数据采集与计算（Gemini2 + reBotArm）
 
 【模式】
-  自动模式（默认）：机械臂自动移动到 36 个预设姿态，每个姿态按 Enter 采集。
+  自动模式（默认）：机械臂自动遍历 50 个预设姿态，到位后若识别到 ArUco
+                     则自动采集，超时则跳过该姿态。
   手动模式（--manual）：重力补偿控制，用户手动推动机械臂到任意位置，
                         放手后臂自动锁定，按 Enter 采集。
 
@@ -111,6 +112,12 @@ CALIB_POSES_XYZ = [
     (0.30,  0.05, 0.32,  0.75, 0.42,  0.65),
     (0.30, -0.05, 0.32, -0.75, 0.42, -0.65),
 ]
+
+AUTO_MOVE_DURATION_S = 3.0
+AUTO_SETTLE_EXTRA_S = 0.6
+AUTO_MARKER_TIMEOUT_S = 2.5
+AUTO_MARKER_STABLE_FRAMES = 4
+MIN_CALIB_SAMPLES = 5
 
 
 def load_config(path):
@@ -303,7 +310,19 @@ def main():
     mode_str  = "手动（重力补偿）" if args.manual else f"自动（{len(CALIB_POSES_XYZ)} 个预设姿态）"
     gc_ctrl: GravityCompController | None = None
     arm_ctrl  = [None]   # ArmEndPos instance（自动模式）
-    _pose_idx = [0]
+    robot = None
+    auto = {
+        "enabled": not args.manual,
+        "idx": 0,
+        "pose_idx": None,
+        "phase": "idle",
+        "settle_until": 0.0,
+        "timeout_at": 0.0,
+        "stable_frames": 0,
+        "status": "等待启动",
+        "finished": False,
+    }
+    result_saved = [False]
 
     robot_cfg = cfg.get("robot", {})
     try:
@@ -322,7 +341,7 @@ def main():
             ctrl = _ArmEndPos(robot._arm)
             ctrl.start()
             arm_ctrl[0] = ctrl
-            print(f"[机器人] 自动模式就绪，共 {len(CALIB_POSES_XYZ)} 个预设姿态，按 n 开始移动")
+            print(f"[机器人] 自动模式就绪，共 {len(CALIB_POSES_XYZ)} 个预设姿态，将自动遍历采集")
     except Exception as e:
         print(f"[机器人] 连接失败: {e}")
         sys.exit(1)
@@ -331,9 +350,10 @@ def main():
     print(f"相机: {cam_type}  |  模式: {mode_str}  |  算法: {he_method}")
     print(f"ArUco 边长: {aruco_cfg['marker_length_m']*100:.0f}cm  |  保存: {save_path}")
     print()
-    print("【操作】Enter=采集  c=计算保存  pos=当前末端位置  q=退出")
-    if not args.manual:
-        print(f"【移动】n=下一个预设姿态  m x y z [roll pitch yaw]=手动指定位置（米/弧度）")
+    if args.manual:
+        print("【操作】Enter=采集  c/q=结束并计算  pos=当前末端位置")
+    else:
+        print("【操作】自动遍历姿态并自动采样  c/q=中断并计算  pos=当前末端位置")
     print()
 
     # ── 开启相机 ──
@@ -343,8 +363,12 @@ def main():
     print(" 就绪\n")
 
     latest_pose = [None]
-    line_queue: queue.Queue = queue.Queue()
-    make_input_thread(line_queue)
+    line_queue: queue.Queue | None = None
+    if sys.stdin.isatty():
+        line_queue = queue.Queue()
+        make_input_thread(line_queue)
+    else:
+        print("[提示] 当前不是交互终端，已禁用终端输入命令")
 
     def _get_fk() -> np.ndarray:
         """读取当前末端位姿（两种模式均适用）。"""
@@ -353,99 +377,25 @@ def main():
         else:
             return robot.get_tcp_pose()
 
-    def handle_line(raw: str) -> bool:
-        if raw is None:
-            print("\n[中断] 退出")
-            return True
+    def _print_fk() -> None:
+        try:
+            T = _get_fk()
+            t = T[:3, 3]
+            R = T[:3, :3]
+            _p = math.atan2(-R[2, 0], math.sqrt(R[0, 0]**2 + R[1, 0]**2))
+            _r = math.atan2(R[2, 1] / math.cos(_p), R[2, 2] / math.cos(_p))
+            _y = math.atan2(R[1, 0] / math.cos(_p), R[0, 0] / math.cos(_p))
+            print(f"  FK: x={t[0]:+.3f} y={t[1]:+.3f} z={t[2]:+.3f} m"
+                  f"  rpy=[{_r:+.2f} {_p:+.2f} {_y:+.2f}] rad")
+        except Exception as e:
+            print(f"  [错误] {e}")
 
-        line = raw.strip().lower()
-
-        if line == "q":
-            return True
-
-        # pos → 显示当前末端 FK
-        if line == "pos":
-            try:
-                T = _get_fk()
-                t = T[:3, 3]
-                R = T[:3, :3]
-                _p = math.atan2(-R[2, 0], math.sqrt(R[0, 0]**2 + R[1, 0]**2))
-                _r = math.atan2(R[2, 1] / math.cos(_p), R[2, 2] / math.cos(_p))
-                _y = math.atan2(R[1, 0] / math.cos(_p), R[0, 0] / math.cos(_p))
-                print(f"  FK: x={t[0]:+.3f} y={t[1]:+.3f} z={t[2]:+.3f} m"
-                      f"  rpy=[{_r:+.2f} {_p:+.2f} {_y:+.2f}] rad")
-            except Exception as e:
-                print(f"  [错误] {e}")
-            return False
-
-        # n → 下一个预设姿态（仅自动模式）
-        if line == "n" and arm_ctrl[0] is not None:
-            idx = _pose_idx[0] % len(CALIB_POSES_XYZ)
-            x, y, z, roll, pitch, yaw = CALIB_POSES_XYZ[idx]
-            _pose_idx[0] += 1
-            duration = 3.0
-            print(f"  -> 姿态 {idx+1}/{len(CALIB_POSES_XYZ)}: "
-                  f"pos=({x:.2f},{y:.2f},{z:.2f}) rpy=({roll:.2f},{pitch:.2f},{yaw:.2f}) ...")
-            ok = arm_ctrl[0].move_to_traj(x=x, y=y, z=z,
-                                           roll=roll, pitch=pitch, yaw=yaw,
-                                           duration=duration)
-            if ok:
-                time.sleep(duration + 0.5)
-                print("  到位，可按 Enter 采集")
-            else:
-                print("  IK 无解，输入 n 跳到下一个")
-            return False
-
-        # m x y z [roll pitch yaw] → 手动笛卡尔位姿（仅自动模式）
-        if line.startswith("m ") and arm_ctrl[0] is not None:
-            try:
-                vals = [float(v) for v in raw.strip().split()[1:]]
-                if len(vals) not in (3, 6):
-                    print("  格式: m x y z [roll pitch yaw]")
-                    return False
-                x, y, z = vals[0], vals[1], vals[2]
-                roll  = vals[3] if len(vals) == 6 else 0.0
-                pitch = vals[4] if len(vals) == 6 else 0.0
-                yaw   = vals[5] if len(vals) == 6 else 0.0
-                ok = arm_ctrl[0].move_to_traj(x=x, y=y, z=z,
-                                               roll=roll, pitch=pitch, yaw=yaw,
-                                               duration=3.0)
-                if ok:
-                    time.sleep(3.5)
-                    print("  到位，可按 Enter 采集")
-                else:
-                    print("  IK 无解")
-            except Exception as e:
-                print(f"  [错误] {e}")
-            return False
-
-        # c → 计算并保存
-        if line == "c":
-            if calibrator.n_samples < 5:
-                print(f"  样本数不足（{calibrator.n_samples} < 5），继续采集")
-                return False
-            print(f"\n  计算中（{calibrator.n_samples} 个样本）...")
-            try:
-                result = calibrator.calibrate(min_samples=5)
-                HandEyeCalibrator.save(result, save_path)
-                t = result.T_result[:3, 3]
-                R = result.T_result[:3, :3]
-                print(f"  T_cam2gripper 平移: x={t[0]:.4f} y={t[1]:.4f} z={t[2]:.4f} m")
-                print(f"  旋转矩阵:\n{R}")
-                print(f"  [OK] 已保存至 {save_path}")
-                if calibrator.n_samples < 15:
-                    print("  提示：样本 < 15，建议继续采集以提高精度")
-            except Exception as e:
-                print(f"  [错误] 计算失败: {e}")
-            return False
-
-        # Enter（空行）→ 采集
-        cur = latest_pose[0]
+    def capture_sample(cur, source: str) -> bool:
         if cur is None:
             print("  [跳过] 标记不在视野中，请调整后重试")
             return False
 
-        print(f"\n[样本 {calibrator.n_samples + 1}]")
+        print(f"\n[样本 {calibrator.n_samples + 1}] {source}")
         print(f"  ArUco: x={cur.T_marker2cam[0,3]:.3f} "
               f"y={cur.T_marker2cam[1,3]:.3f} "
               f"z={cur.T_marker2cam[2,3]:.3f} m")
@@ -455,13 +405,149 @@ def main():
             print(f"  末端 (FK): x={t[0]:.4f} y={t[1]:.4f} z={t[2]:.4f} m")
             calibrator.add_sample(T_g2b, cur.T_marker2cam)
             print(f"  [OK] 已记录，共 {calibrator.n_samples} 个样本"
-                  + ("  <- 可输入 c 计算" if calibrator.n_samples >= 15 else ""))
+                  + ("  <- 结束时将自动计算" if calibrator.n_samples >= 15 else ""))
+            return True
         except Exception as e:
             print(f"  [错误] 获取末端位姿失败: {e}")
+            return False
+
+    def compute_and_save(reason: str) -> bool:
+        print(f"\n[结束] {reason}")
+        if calibrator.n_samples < MIN_CALIB_SAMPLES:
+            print(f"[结果] 样本不足（{calibrator.n_samples} < {MIN_CALIB_SAMPLES}），未计算标定结果")
+            if save_path.exists():
+                print("[结果] 现有 hand_eye.npz 未更新")
+            return False
+
+        print(f"[结果] 计算中（{calibrator.n_samples} 个样本）...")
+        try:
+            result = calibrator.calibrate(min_samples=MIN_CALIB_SAMPLES)
+            HandEyeCalibrator.save(result, save_path)
+            t = result.T_result[:3, 3]
+            R = result.T_result[:3, :3]
+            print(f"[结果] T_cam2gripper 平移: x={t[0]:.4f} y={t[1]:.4f} z={t[2]:.4f} m")
+            print(f"[结果] 旋转矩阵:\n{R}")
+            print(f"[结果] [OK] 已保存至 {save_path}")
+            if calibrator.n_samples < 15:
+                print("[结果] 提示：样本 < 15，建议继续采集以提高精度")
+            result_saved[0] = True
+            return True
+        except Exception as e:
+            print(f"[结果] [错误] 计算失败: {e}")
+            return False
+
+    def start_next_auto_pose() -> bool:
+        if not auto["enabled"] or arm_ctrl[0] is None:
+            return False
+
+        total = len(CALIB_POSES_XYZ)
+        while auto["idx"] < total:
+            idx = auto["idx"]
+            x, y, z, roll, pitch, yaw = CALIB_POSES_XYZ[idx]
+            print(f"\n[自动] 姿态 {idx+1}/{total}: "
+                  f"pos=({x:.2f},{y:.2f},{z:.2f}) rpy=({roll:.2f},{pitch:.2f},{yaw:.2f})")
+            ok = arm_ctrl[0].move_to_traj(
+                x=x,
+                y=y,
+                z=z,
+                roll=roll,
+                pitch=pitch,
+                yaw=yaw,
+                duration=AUTO_MOVE_DURATION_S,
+            )
+            if ok:
+                now = time.monotonic()
+                auto["pose_idx"] = idx
+                auto["phase"] = "settling"
+                auto["settle_until"] = now + AUTO_MOVE_DURATION_S + AUTO_SETTLE_EXTRA_S
+                auto["timeout_at"] = auto["settle_until"] + AUTO_MARKER_TIMEOUT_S
+                auto["stable_frames"] = 0
+                auto["status"] = f"姿态 {idx+1}/{total} 移动中"
+                return False
+
+            print(f"[自动] 姿态 {idx+1}/{total} IK 无解，跳过")
+            auto["idx"] += 1
+
+        auto["phase"] = "done"
+        auto["finished"] = True
+        auto["status"] = "全部姿态已遍历"
+        print("\n[自动] 全部预设姿态遍历完成")
+        return True
+
+    def tick_auto(cur) -> bool:
+        if not auto["enabled"] or auto["finished"]:
+            return auto["finished"]
+
+        if auto["phase"] == "idle":
+            return start_next_auto_pose()
+
+        pose_idx = auto["pose_idx"]
+        total = len(CALIB_POSES_XYZ)
+        now = time.monotonic()
+
+        if auto["phase"] == "settling":
+            remain = auto["settle_until"] - now
+            if remain > 0.0:
+                auto["stable_frames"] = 0
+                auto["status"] = f"姿态 {pose_idx+1}/{total} 移动/稳定中 {remain:.1f}s"
+                return False
+            auto["phase"] = "searching"
+
+        if cur is not None:
+            auto["stable_frames"] += 1
+            remain = max(0.0, auto["timeout_at"] - now)
+            auto["status"] = (
+                f"姿态 {pose_idx+1}/{total} 识别稳定 "
+                f"{auto['stable_frames']}/{AUTO_MARKER_STABLE_FRAMES}  剩余 {remain:.1f}s"
+            )
+            if auto["stable_frames"] >= AUTO_MARKER_STABLE_FRAMES:
+                capture_sample(cur, f"自动姿态 {pose_idx+1}/{total}")
+                auto["idx"] += 1
+                auto["phase"] = "idle"
+                auto["stable_frames"] = 0
+                return start_next_auto_pose()
+        else:
+            auto["stable_frames"] = 0
+            remain = max(0.0, auto["timeout_at"] - now)
+            auto["status"] = f"姿态 {pose_idx+1}/{total} 等待 ArUco {remain:.1f}s"
+
+        if now >= auto["timeout_at"]:
+            print(f"[自动] 姿态 {pose_idx+1}/{total} 未识别到 ArUco，跳过")
+            auto["idx"] += 1
+            auto["phase"] = "idle"
+            auto["stable_frames"] = 0
+            return start_next_auto_pose()
+
+        return False
+
+    def handle_line(raw: str) -> bool:
+        if raw is None:
+            print("\n[中断] 终端输入已关闭，停止采集并尝试计算")
+            return True
+
+        line = raw.strip().lower()
+
+        if line in {"q", "c"}:
+            return True
+
+        if line == "pos":
+            _print_fk()
+            return False
+
+        if args.manual and line == "":
+            capture_sample(latest_pose[0], "手动采集")
+            return False
+
+        if line:
+            if args.manual:
+                print("  手动模式支持: Enter=采集  c/q=结束并计算  pos=当前末端位姿")
+            else:
+                print("  自动模式支持: c/q=结束并计算  pos=当前末端位姿")
         return False
 
     # ── 主循环 ──
     WIN = "Eye-in-Hand Calibration  (operate in terminal)"
+    finish_reason = "正常结束"
     try:
         cv2.namedWindow(WIN, cv2.WINDOW_AUTOSIZE)
 
@@ -470,6 +556,8 @@ def main():
             if bgr is not None:
                 pose = cam.detect_aruco(bgr)
                 latest_pose[0] = pose
+                if tick_auto(pose):
+                    finish_reason = "自动遍历完成"
                 vis  = cam.draw_aruco(bgr)
                 n    = calibrator.n_samples
 
@@ -478,17 +566,30 @@ def main():
                                 0.55, color, 1, cv2.LINE_AA)
 
                 if pose:
-                    osd(f"[ID={pose.id}] z={pose.T_marker2cam[2,3]:.3f}m  "
-                        f"samples:{n}  Enter=capture  c=compute  q=quit",
-                        28, (80, 220, 80))
+                    if args.manual:
+                        osd(f"[ID={pose.id}] z={pose.T_marker2cam[2,3]:.3f}m  "
+                            f"samples:{n}  Enter=capture  c/q=finish",
+                            28, (80, 220, 80))
+                    else:
+                        osd(f"[ID={pose.id}] z={pose.T_marker2cam[2,3]:.3f}m  samples:{n}",
+                            28, (80, 220, 80))
                 else:
-                    osd(f"No marker  samples:{n}  move arm to see marker",
-                        28, (80, 80, 220))
+                    if args.manual:
+                        osd(f"No marker  samples:{n}  move arm to see marker",
+                            28, (80, 80, 220))
+                    else:
+                        osd(f"No marker  samples:{n}",
+                            28, (80, 80, 220))
+
+                if args.manual:
+                    osd("MANUAL: Enter=capture  c/q=finish  pos=print fk", 50, (180, 180, 60))
+                else:
+                    osd(f"AUTO: {auto['status']}", 50, (180, 180, 60))
 
                 filled = min(n, 15) * (400 // 15)
-                cv2.rectangle(vis, (10, 40), (10 + filled, 52), (0, 200, 100), -1)
-                cv2.rectangle(vis, (10, 40), (410, 52), (160, 160, 160), 1)
-                cv2.putText(vis, f"{n}/15", (10, 65),
+                cv2.rectangle(vis, (10, 70), (10 + filled, 82), (0, 200, 100), -1)
+                cv2.rectangle(vis, (10, 70), (410, 82), (160, 160, 160), 1)
+                cv2.putText(vis, f"{n}/15", (10, 95),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
                 mode_label = "MANUAL(GravComp)" if args.manual else "AUTO"
@@ -498,18 +599,25 @@ def main():
                 cv2.imshow(WIN, vis)
 
             if cv2.waitKey(30) & 0xFF in [ord('q'), ord('Q'), 27]:
+                finish_reason = "窗口退出"
                 break
             if cv2.getWindowProperty(WIN, cv2.WND_PROP_VISIBLE) < 1:
+                finish_reason = "窗口关闭"
                 break
 
             try:
-                if handle_line(line_queue.get_nowait()):
+                if line_queue is not None and handle_line(line_queue.get_nowait()):
+                    finish_reason = "用户中断"
                     break
             except queue.Empty:
                 pass
 
+            if auto["finished"]:
+                break
+
     except KeyboardInterrupt:
-        print("\n[Ctrl+C] 退出")
+        finish_reason = "Ctrl+C 中断"
+        print("\n[Ctrl+C] 停止采集并尝试计算")
 
     finally:
         cv2.destroyAllWindows()
@@ -524,10 +632,11 @@ def main():
                     arm_ctrl[0].arm.disconnect()
                 except Exception:
                     pass
+        compute_and_save(finish_reason)
 
     print(f"\n结束，共 {calibrator.n_samples} 个样本。")
-    if calibrator.n_samples > 0 and not save_path.exists():
-        print("提示：标定结果未保存，可重新运行后输入 c 计算。")
+    if calibrator.n_samples > 0 and not result_saved[0]:
+        print("提示：本次未生成新的 hand_eye.npz，可补充样本后重试。")
 
 
 if __name__ == "__main__":
