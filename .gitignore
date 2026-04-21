@@ -1,15 +1,8 @@
-cameraws
 instructions.md
 Log
 data
-scripts/*
-!scripts/main.py
-!scripts/grasp.py
-!scripts/collect_handeye_eih.py
-!scripts/pca_grasp_pipeline.py
-!scripts/grasp_estimate.py
-!scripts/gripper.py
-!scripts/hggd_grasp_pipeline.py
+*pycache*
+unused
 mobileclip2_b.ts
 sdk
 PLAN.md
