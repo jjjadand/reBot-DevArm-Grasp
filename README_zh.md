@@ -11,7 +11,7 @@
     <img src="https://img.shields.io/badge/Python-3.10+-blue.svg" alt="Python Version">
     <img src="https://img.shields.io/badge/Platform-Ubuntu%2022.04+-orange.svg" alt="Platform">
     <img src="https://img.shields.io/badge/Camera-Orbbec%20Gemini%202-green.svg" alt="Camera">
-    <img src="https://img.shields.io/badge/Detection-YOLOv11-yellow.svg" alt="YOLO">
+    <img src="https://img.shields.io/badge/Detection-YOLO-yellow.svg" alt="YOLO">
 </p>
 
 <p align="center">
@@ -68,7 +68,7 @@ sudo chmod 666 /dev/ttyUSB0        # USB2CAN（端口号按实际调整）
 ### Step 1. 克隆仓库
 
 ```bash
-git clone https://github.com/your-org/cameraws.git
+git clone https://github.com/EclipseaHime017/SeeedStudioTargetDetection.git
 cd cameraws
 git submodule update --init --recursive
 ```
@@ -108,8 +108,8 @@ motorbridge>=0.1.7
 ### Step 4. 安装机械臂控制库
 
 ```bash
-git clone https://github.com/vectorBH6/reBotArm_control_py.git ~/seeed/reBotArm_control_py
-cd ~/seeed/reBotArm_control_py
+git clone https://github.com/vectorBH6/reBotArm_control_py.git sdk/reBotArm_control_py
+cd sdk/reBotArm_control_py
 pip install -e .
 ```
 
@@ -202,7 +202,8 @@ cameraws/
 │   ├── object_detection.py
 │   └── collect_handeye_eih.py
 ├── sdk/
-│   └── pyorbbecsdk/              # Orbbec SDK Python 封装（submodule）
+│   ├── pyorbbecsdk/              # Orbbec SDK Python 封装（submodule）
+│   └── reBotArm_control_py/      # reBot Arm SDK
 └── requirements.txt
 ```
 
@@ -222,7 +223,7 @@ camera:
   fps: 30
 
 robot:
-  repo_root: ~/seeed/reBotArm_control_py   # 机械臂库路径
+  repo_root: null   # 自动识别 sdk/reBotArm_control_py
   ready_pose:
     x: 0.3
     y: 0.0
@@ -245,7 +246,7 @@ yolo:
 python scripts/collect_handeye_eih.py
 ```
 
-按提示将机械臂移动到多个位姿，采集 ArUco 标记图像（建议 ≥15 个位姿），标定结果自动保存到 `config/calibration/orbbec_gemini2/hand_eye.npz`。
+机械臂会自动遍历 50 个预设位姿，检测到 ArUco 稳定后自动采样。正常结束或中途打断时，脚本都会尝试计算并保存标定结果；至少需要 5 个样本，建议 ≥15 个样本以获得更稳的结果。
 
 ---
 
@@ -288,7 +289,7 @@ Eye-in-Hand 模式手眼标定，使用 ArUco 标记，支持 TSAI / PARK / HORA
 
 ## ☎ 联系我们
 
-- **技术支持**：[提交 Issue](https://github.com/your-org/cameraws/issues)
+- **技术支持**：[提交 Issue](https://github.com/EclipseaHime017/SeeedStudioTargetDetection/issues)
 
 ---
 

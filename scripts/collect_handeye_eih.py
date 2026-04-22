@@ -30,13 +30,11 @@ import yaml
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-_REBOT_ROOT = Path(__file__).resolve().parent.parent.parent / "reBotArm_control_py"
-if _REBOT_ROOT.exists() and str(_REBOT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REBOT_ROOT))
 
 os.environ.setdefault("QT_QPA_FONTDIR", "/usr/share/fonts/truetype")
 
 from cameraws.drivers.camera import make_camera
+from cameraws.drivers.robot import RebotArm, ensure_rebot_sdk_in_syspath
 from cameraws.calibration.hand_eye import CalibMode, HandEyeCalibrator
 
 
@@ -309,8 +307,7 @@ def main():
     # ── 机器人 ──
     mode_str  = "手动（重力补偿）" if args.manual else f"自动（{len(CALIB_POSES_XYZ)} 个预设姿态）"
     gc_ctrl: GravityCompController | None = None
-    arm_ctrl  = [None]   # ArmEndPos instance（自动模式）
-    robot = None
+    robot: RebotArm | None = None
     auto = {
         "enabled": not args.manual,
         "idx": 0,
@@ -326,21 +323,18 @@ def main():
 
     robot_cfg = cfg.get("robot", {})
     try:
+        ensure_rebot_sdk_in_syspath(robot_cfg.get("repo_root"))
         if args.manual:
             gc_ctrl = GravityCompController()
             gc_ctrl.start()
             print(f"[机器人] 手动模式就绪 — 推动机械臂定位后按 Enter 采集")
         else:
-            from cameraws.drivers.robot.rebot_arm import RebotArm
-            from reBotArm_control_py.controllers import ArmEndPos as _ArmEndPos
             robot = RebotArm(
                 config_path=robot_cfg.get("config_path"),
                 urdf_path=robot_cfg.get("urdf_path"),
                 repo_root=robot_cfg.get("repo_root"),
             )
-            ctrl = _ArmEndPos(robot._arm)
-            ctrl.start()
-            arm_ctrl[0] = ctrl
+            robot.connect(enable=True)
             print(f"[机器人] 自动模式就绪，共 {len(CALIB_POSES_XYZ)} 个预设姿态，将自动遍历采集")
     except Exception as e:
         print(f"[机器人] 连接失败: {e}")
@@ -437,7 +431,7 @@ def main():
             return False
 
     def start_next_auto_pose() -> bool:
-        if not auto["enabled"] or arm_ctrl[0] is None:
+        if not auto["enabled"] or robot is None:
             return False
 
         total = len(CALIB_POSES_XYZ)
@@ -446,15 +440,7 @@ def main():
             x, y, z, roll, pitch, yaw = CALIB_POSES_XYZ[idx]
             print(f"\n[自动] 姿态 {idx+1}/{total}: "
                   f"pos=({x:.2f},{y:.2f},{z:.2f}) rpy=({roll:.2f},{pitch:.2f},{yaw:.2f})")
-            ok = arm_ctrl[0].move_to_traj(
-                x=x,
-                y=y,
-                z=z,
-                roll=roll,
-                pitch=pitch,
-                yaw=yaw,
-                duration=AUTO_MOVE_DURATION_S,
-            )
+            ok = robot.move_to(x, y, z, roll=roll, pitch=pitch, yaw=yaw, duration=AUTO_MOVE_DURATION_S)
             if ok:
                 now = time.monotonic()
                 auto["pose_idx"] = idx
@@ -624,14 +610,11 @@ def main():
         cam.close()
         if gc_ctrl is not None:
             gc_ctrl.safe_home()
-        elif arm_ctrl[0] is not None:
+        elif robot is not None:
             try:
-                arm_ctrl[0].end()
-            except (Exception, KeyboardInterrupt):
-                try:
-                    arm_ctrl[0].arm.disconnect()
-                except Exception:
-                    pass
+                robot.disconnect()
+            except Exception:
+                pass
         compute_and_save(finish_reason)
 
     print(f"\n结束，共 {calibrator.n_samples} 个样本。")

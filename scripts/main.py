@@ -63,17 +63,6 @@ def load_hand_eye(project_root: Path, cam_type: str) -> tuple[Optional[np.ndarra
     return T, mode
 
 
-def _wait_move(robot: RebotArm, duration: float, extra: float = 0.6) -> None:
-    ctrl = robot._endpos_ctrl
-    if ctrl is None:
-        return
-    thread = ctrl._send_thread
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=duration + extra + 2.0)
-    else:
-        time.sleep(duration + extra)
-
-
 def _move_ready(robot: RebotArm, ready_cfg: dict[str, Any]) -> None:
     duration = float(ready_cfg.get("duration", 3.0))
     robot.move_to(
@@ -85,7 +74,7 @@ def _move_ready(robot: RebotArm, ready_cfg: dict[str, Any]) -> None:
         float(ready_cfg.get("yaw", 0.0)),
         duration=duration,
     )
-    _wait_move(robot, duration)
+    robot.wait_motion(duration)
 
 
 def _cam_to_base(T_hand_eye: np.ndarray, robot: RebotArm) -> np.ndarray:
@@ -138,13 +127,13 @@ def _execute_grasp(
     if not robot.move_to(xp, yp, zp, rxp, ryp, rzp, duration=2.0):
         print("[Grasp] 预夹取 IK 失败，中止")
         return False
-    _wait_move(robot, 2.0)
+    robot.wait_motion(2.0)
 
     print("[Grasp] 移动到夹取位...")
     if not robot.move_to(xg, yg, zg, rxg, ryg, rzg, duration=1.5):
         print("[Grasp] 夹取 IK 失败，中止")
         return False
-    _wait_move(robot, 1.5)
+    robot.wait_motion(1.5)
 
     print("[Grasp] 夹取中...")
     ok = robot.grasp()

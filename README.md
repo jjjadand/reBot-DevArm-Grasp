@@ -11,7 +11,7 @@
     <img src="https://img.shields.io/badge/Python-3.10+-blue.svg" alt="Python Version">
     <img src="https://img.shields.io/badge/Platform-Ubuntu%2022.04+-orange.svg" alt="Platform">
     <img src="https://img.shields.io/badge/Camera-Orbbec%20Gemini%202-green.svg" alt="Camera">
-    <img src="https://img.shields.io/badge/Detection-YOLOv11-yellow.svg" alt="YOLO">
+    <img src="https://img.shields.io/badge/Detection-YOLO-yellow.svg" alt="YOLO">
 </p>
 
 <p align="center">
@@ -68,7 +68,7 @@ sudo chmod 666 /dev/ttyUSB0        # USB2CAN (adjust port as needed)
 ### Step 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-org/cameraws.git
+git clone https://github.com/EclipseaHime017/SeeedStudioTargetDetection.git
 cd cameraws
 git submodule update --init --recursive
 ```
@@ -108,8 +108,8 @@ motorbridge>=0.1.7
 ### Step 4. Install the robotic arm control library
 
 ```bash
-git clone https://github.com/vectorBH6/reBotArm_control_py.git ~/seeed/reBotArm_control_py
-cd ~/seeed/reBotArm_control_py
+git clone https://github.com/vectorBH6/reBotArm_control_py.git sdk/reBotArm_control_py
+cd sdk/reBotArm_control_py
 pip install -e .
 ```
 
@@ -202,7 +202,8 @@ cameraws/
 │   ├── object_detection.py
 │   └── collect_handeye_eih.py
 ├── sdk/
-│   └── pyorbbecsdk/              # Orbbec SDK Python wrapper (submodule)
+│   ├── pyorbbecsdk/              # Orbbec SDK Python wrapper (submodule)
+│   └── reBotArm_control_py/      # reBot Arm SDK
 └── requirements.txt
 ```
 
@@ -222,7 +223,7 @@ camera:
   fps: 30
 
 robot:
-  repo_root: ~/seeed/reBotArm_control_py   # path to arm library
+  repo_root: null   # auto-detects sdk/reBotArm_control_py
   ready_pose:
     x: 0.3
     y: 0.0
@@ -245,7 +246,7 @@ yolo:
 python scripts/collect_handeye_eih.py
 ```
 
-Follow the prompts to move the arm to multiple poses and capture ArUco marker images (at least 15 poses recommended). The calibration result is saved automatically to `config/calibration/orbbec_gemini2/hand_eye.npz`.
+The arm will automatically traverse 50 preset poses and record a sample whenever the ArUco marker is detected stably. If the run finishes normally or is interrupted midway, the script will still attempt to compute and save the calibration result; at least 5 samples are required, and 15 or more are recommended.
 
 ---
 
@@ -288,7 +289,7 @@ Eye-in-Hand hand-eye calibration using ArUco markers. Supports TSAI, PARK, and H
 
 ## ☎ Contact Us
 
-- **Technical Support**: [Submit an Issue](https://github.com/your-org/cameraws/issues)
+- **Technical Support**: [Submit an Issue](https://github.com/EclipseaHime017/SeeedStudioTargetDetection/issues)
 
 ---
 

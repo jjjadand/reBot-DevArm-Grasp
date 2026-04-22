@@ -16,7 +16,6 @@ cameraws.drivers.robot.rebot_arm
     grasp(force, timeout)  — 柔性夹取（阻塞）
     release_gripper()      — 张开并回零（阻塞）
     get_gripper_state()    — 读取 (pos, vel, torq)
-    set_gripper_force(f)   — 设置保持力矩
     set_gripper_zero()     — 设置当前位置为零点
     gripper_is_holding     — 属性：是否处于力控保持状态
 """
@@ -32,21 +31,39 @@ from typing import Optional
 import numpy as np
 
 
-def _find_repo_root(hint: Optional[str] = None) -> Path:
+_CAMERAWS_ROOT = Path(__file__).resolve().parents[2]
+_REBOT_REPO_NAME = "reBotArm_control_py"
+
+
+def _is_rebot_repo_root(path: Path) -> bool:
+    return path.is_dir() and (path / _REBOT_REPO_NAME).is_dir()
+
+
+def find_rebot_repo_root(hint: Optional[str] = None) -> Path:
     candidates = []
     if hint:
         candidates.append(Path(hint).expanduser().resolve())
     candidates += [
-        Path.home() / "seeed" / "reBotArm_control_py",
-        Path("/home/chlorine/seeed/reBotArm_control_py"),
+        _CAMERAWS_ROOT / "sdk" / _REBOT_REPO_NAME,
+        _CAMERAWS_ROOT.parent / _REBOT_REPO_NAME,
+        Path.home() / "seeed" / _REBOT_REPO_NAME,
+        Path("/home/chlorine/seeed") / _REBOT_REPO_NAME,
     ]
     for p in candidates:
-        if (p / "reBotArm_control_py").is_dir():
+        if _is_rebot_repo_root(p):
             return p
     raise FileNotFoundError(
         "找不到 reBotArm_control_py 仓库，请在 config/default.yaml 中设置 "
-        "robot.repo_root 或执行 pip install -e ~/seeed/reBotArm_control_py"
+        "robot.repo_root，或将 SDK 放到 cameraws/sdk/reBotArm_control_py"
     )
+
+
+def ensure_rebot_sdk_in_syspath(hint: Optional[str] = None) -> Path:
+    repo = find_rebot_repo_root(hint)
+    repo_str = str(repo)
+    if repo_str not in sys.path:
+        sys.path.insert(0, repo_str)
+    return repo
 
 
 # ── 夹爪状态机常量 ────────────────────────────────────────────────────────────
@@ -94,9 +111,8 @@ class RebotArm:
         urdf_path:   Optional[str] = None,
         repo_root:   Optional[str] = None,
     ) -> None:
-        repo = _find_repo_root(repo_root)
-        if str(repo) not in sys.path:
-            sys.path.insert(0, str(repo))
+        repo = ensure_rebot_sdk_in_syspath(repo_root)
+        self._repo_root = repo
 
         from reBotArm_control_py.actuator import RobotArm
         from reBotArm_control_py.kinematics import (
@@ -183,8 +199,7 @@ class RebotArm:
         from motorbridge import Mode, CallError
 
         if cfg_path is None:
-            repo = _find_repo_root()
-            cfg_path = str(repo / "config" / "gripper.yaml")
+            cfg_path = str(self._repo_root / "config" / "gripper.yaml")
 
         gcfg = load_gripper_cfg(cfg_path)
         gc = gcfg["gripper"]
@@ -450,17 +465,6 @@ class RebotArm:
         """返回 (pos_rad, vel_rad_s, torq_nm)。"""
         return (self._g_pos, self._g_vel, self._g_torq)
 
-    def set_gripper_force(self, force: float) -> None:
-        """设置力控保持力矩 (Nm)。"""
-        with self._g_lock:
-            self._g_target_force = float(np.clip(force, 0.05, _G_TAU_MAX))
-
-    @property
-    def gripper_force(self) -> float:
-        """当前目标夹取力矩 (Nm)。"""
-        with self._g_lock:
-            return self._g_target_force
-
     def set_gripper_zero(self) -> bool:
         """设置当前位置为零点（会暂停控制循环）。"""
         if self._gripper_mot is None:
@@ -505,6 +509,16 @@ class RebotArm:
         return bool(self._endpos_ctrl.move_to_traj(
             x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw, duration=duration,
         ))
+
+    def wait_motion(self, duration: float, extra: float = 0.6) -> None:
+        """等待当前末端轨迹发送线程结束。"""
+        if self._endpos_ctrl is None:
+            return
+        thread = getattr(self._endpos_ctrl, "_send_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=duration + extra + 2.0)
+        else:
+            time.sleep(duration + extra)
 
     def safe_home(self, duration: float = 3.0) -> None:
         """回零位（关节全部归零）。"""
