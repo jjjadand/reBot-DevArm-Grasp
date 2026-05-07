@@ -9,6 +9,7 @@ Usage:
     cd /home/chlorine/seeed/cameraws
     conda activate seeed
     python scripts/graspnet_camera_demo.py
+    python scripts/graspnet_camera_demo.py --camera-type orbbec_gemini2
 
 Keys:
     g / space  Run GraspNet on the current frame
@@ -56,12 +57,24 @@ from data_utils import CameraInfo, create_point_cloud_from_depth_image  # noqa: 
 from graspnet import GraspNet, pred_decode  # noqa: E402
 from graspnetAPI import GraspGroup  # noqa: E402
 
+DISPLAY_FLIP_X = np.array(
+    [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, -1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ],
+    dtype=np.float64,
+)
+
 
 class Open3DGraspWindow:
     def __init__(self, title: str, top_k: int) -> None:
         self._top_k = top_k
         self._vis = o3d.visualization.Visualizer()
-        self._vis.create_window(title, width=1280, height=720)
+        if not self._vis.create_window(title, width=1280, height=720):
+            self._vis.destroy_window()
+            raise RuntimeError("Open3D visualizer window could not be created")
         self._geometries = []
         self._initialized = False
 
@@ -70,12 +83,16 @@ class Open3DGraspWindow:
             self._vis.remove_geometry(geom, reset_bounding_box=False)
         self._geometries = []
 
-        geometries = [cloud]
+        cloud_vis = o3d.geometry.PointCloud(cloud)
+        cloud_vis.transform(DISPLAY_FLIP_X)
+        geometries = [cloud_vis]
         if len(grasps) > 0:
-            grasps = grasps.nms()
-            grasps.sort_by_score()
-            grasps = grasps[: self._top_k]
-            geometries.extend(grasps.to_open3d_geometry_list())
+            grasps_vis = GraspGroup(grasps.grasp_group_array.copy())
+            grasps_vis = grasps_vis.nms()
+            grasps_vis.sort_by_score()
+            grasps_vis = grasps_vis[: self._top_k]
+            grasps_vis.transform(DISPLAY_FLIP_X)
+            geometries.extend(grasps_vis.to_open3d_geometry_list())
         for geom in geometries:
             self._vis.add_geometry(geom, reset_bounding_box=not self._initialized)
         self._geometries = geometries
@@ -244,9 +261,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--camera-type",
-        default="realsense_d435i",
+        default=None,
         choices=("realsense_d435i", "realsense_d405", "orbbec_gemini2"),
-        help="camera driver to use; defaults to RealSense D435i",
+        help="camera driver to use; defaults to camera.type in config",
     )
     parser.add_argument("--width", type=int, default=None, help="override camera color/depth width")
     parser.add_argument("--height", type=int, default=None, help="override camera color/depth height")
@@ -311,7 +328,11 @@ def load_config(path: str) -> dict:
 
 def configure_camera(cfg: dict, args: argparse.Namespace) -> dict:
     cam_cfg = cfg.setdefault("camera", {})
-    cam_cfg["type"] = args.camera_type
+    if args.camera_type is not None:
+        cam_cfg["type"] = args.camera_type
+    cam_type = str(cam_cfg.get("type", "")).lower()
+    if not cam_type:
+        raise ValueError("camera.type is missing in config; pass --camera-type or set it in YAML")
 
     if args.width is not None:
         cam_cfg["color_width"] = args.width
@@ -321,7 +342,7 @@ def configure_camera(cfg: dict, args: argparse.Namespace) -> dict:
         cam_cfg["depth_height"] = args.height
     if args.fps is not None:
         cam_cfg["fps"] = args.fps
-    elif "realsense" in args.camera_type:
+    elif args.camera_type is not None and "realsense" in cam_type:
         cam_cfg["fps"] = 15
 
     return cfg
@@ -770,7 +791,8 @@ def main() -> None:
         f"{cam_cfg['type']} "
         f"{cam_cfg.get('color_width')}x{cam_cfg.get('color_height')}@{cam_cfg.get('fps')}"
     )
-    if "realsense" in cam_cfg["type"]:
+    cam_type = str(cam_cfg["type"]).lower()
+    if "realsense" in cam_type:
         cam = DirectRealSenseCamera(
             cam_cfg.get("color_width", 1280),
             cam_cfg.get("color_height", 720),
@@ -779,6 +801,7 @@ def main() -> None:
     else:
         cam = make_camera(cfg)
     vis: Optional[Open3DGraspWindow] = None
+    visualizer_enabled = not args.no_visualizer
     status = "warming up camera..."
     target_status = "YOLO disabled: full-scene GraspNet" if yolo_model is None else "target detector warming up..."
     last_targets: list[DetectionTarget] = []
@@ -897,10 +920,17 @@ def main() -> None:
                         )
                     print(status)
 
-                    if not args.no_visualizer:
-                        if vis is None:
-                            vis = Open3DGraspWindow("GraspNet Grasps", args.top_k)
-                        vis.update(o3d_cloud, gg)
+                    if visualizer_enabled:
+                        try:
+                            if vis is None:
+                                vis = Open3DGraspWindow("GraspNet Grasps", args.top_k)
+                            vis.update(o3d_cloud, gg)
+                        except Exception as exc:
+                            visualizer_enabled = False
+                            if vis is not None:
+                                vis.close()
+                                vis = None
+                            print(f"Open3D visualizer disabled: {exc}")
                 except Exception as exc:
                     status = f"inference failed: {exc}"
                     print(status)

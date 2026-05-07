@@ -8,3 +8,5 @@ __pycache__/
 *.pyc
 sdk/*
 models/
+scripts/graspnet_camera_demo.py
+scripts/grasp.py
