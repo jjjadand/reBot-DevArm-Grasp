@@ -1,306 +1,394 @@
-# 🦾 reBot Arm B601-DM Visual Grasping Demo
+# reBot GraspNet Demo
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/Seeed-Projects/reBot-DevArm/main/media/v1.0.png" alt="reBot Arm B601">
-</p>
+This repository runs a reBot Arm B601-DM visual grasping demo on Jetson with an
+Orbbec Gemini 2 RGB-D camera. The current project uses:
 
-<p align="center">
-    <a href="./LICENSE">
-        <img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT">
-    </a>
-    <img src="https://img.shields.io/badge/Python-3.10+-blue.svg" alt="Python Version">
-    <img src="https://img.shields.io/badge/Platform-Ubuntu%2022.04+-orange.svg" alt="Platform">
-    <img src="https://img.shields.io/badge/Camera-Orbbec%20Gemini%202-green.svg" alt="Camera">
-    <img src="https://img.shields.io/badge/Detection-YOLO-yellow.svg" alt="YOLO">
-</p>
+- `conda` environment: `graspnet`
+- Camera: Orbbec Gemini 2 through `pyorbbecsdk`
+- Detector: TensorRT YOLO segmentation engine, `models/yolo11n-seg.engine`
+- Grasp planner: GraspNet baseline checkpoint, `sdk/graspnet-baseline/checkpoints/checkpoint-rs.tar`
+- Calibration: Eye-in-hand hand-eye calibration saved as `config/calibration/orbbec_gemini2/hand_eye.npz`
 
-<p align="center">
-  <strong>Depth Perception · Object Detection · Hand-Eye Calibration · Autonomous Grasping · Fully Open Source</strong>
-</p>
+The normal safe workflow is:
 
-<p align="center">
-  <strong>
-    <a href="./README_zh.md">简体中文</a> &nbsp;|&nbsp;
-    <a href="./README.md">English</a>
-  </strong>
-</p>
+1. Verify the camera.
+2. Verify the arm connection.
+3. Verify or redo hand-eye calibration.
+4. Verify the GraspNet Python/CUDA stack.
+5. Run camera-only demos.
+6. Run robot dry-run.
+7. Run real grasp motion.
 
----
+## Hardware Layout
 
-## 📖 Introduction
+- Mount the Orbbec Gemini 2 rigidly on the robot end effector.
+- Keep the ArUco calibration marker fixed on the table during calibration.
+- Keep the object workspace clear of the arm before any robot motion command.
+- Connect the Gemini 2 by USB 3.0.
+- Connect the reBot arm through the USB2CAN adapter.
 
-**reBot Arm B601-DM Visual Grasping Demo** is a vision-based grasping demo that integrates the [reBot Arm B601](https://github.com/vectorBH6/reBotArm_control_py) robotic arm control library with the **Orbbec Gemini 2** depth camera. The system uses a YOLO model to detect tabletop objects in real time, estimates grasp poses via OBB minimum bounding rectangles, transforms grasp points from camera space to robot base space through hand-eye calibration, and drives the arm to perform autonomous grasping.
+The default calibration marker settings are in `config/default.yaml`:
 
-### ✨ Core Features
+```yaml
+calibration:
+  aruco:
+    marker_length_m: 0.1
+    dict_id: 0
+    target_marker_id: 0
+  hand_eye_method: TSAI
+```
 
-- 📷 **Depth Perception** — Orbbec Gemini 2 provides aligned RGB + depth frames (1280×720 @ 30fps)
-- 🔍 **Object Detection** — YOLO model-based recognition with open-vocabulary custom classes
-- 📐 **Pose Estimation** — OBB short-axis direction for gripper orientation; depth quantile for grasp height
-- 🔄 **Coordinate Transform** — TSAI hand-eye calibration (Eye-in-Hand) to map camera-frame grasp points to robot base frame
-- 🦾 **Motion Execution** — reBotArm_control_py IK + trajectory controller with built-in gripper force-control state machine
+This means the printed marker must be ArUco dictionary `DICT_4X4_50`, marker ID
+`0`, with a measured black-square edge length of `100 mm`. The repo includes
+`aruco100x100.pdf`.
 
----
+## Environment
 
-## ⚙️ Hardware Setup
-
-| Component | Model / Requirement |
-|-----------|-------------------|
-| Robotic Arm | reBot Arm B601-DM (DAMIAO motor variant) |
-| Depth Camera | Orbbec Gemini 2 |
-| Communication | USB2CAN serial bridge (arm); USB 3.0 (camera) |
-| Host PC | Ubuntu 22.04+, Python 3.10, x86_64 |
-
-**Wiring**
-
-1. Connect the Gemini 2 to the host via USB 3.0
-2. Connect the USB2CAN adapter to the arm's CAN bus and plug it into the host
-3. Set device permissions:
+Activate the existing environment from the repo root:
 
 ```bash
-sudo chmod a+rw /dev/bus/usb/*/*   # Orbbec camera
-sudo chmod 666 /dev/ttyUSB0        # USB2CAN (adjust port as needed)
+conda activate graspnet
+cd /home/seeed/Downloads/rebot_grasp
 ```
 
----
-
-## 🚀 Quick Start
-
-### Step 1. Clone the repository
+On Jetson, make sure CUDA is visible before building GraspNet CUDA extensions:
 
 ```bash
-git clone https://github.com/Seeed-Projects/reBot-DevArm-Grasp.git rebot_grasp
-cd rebot_grasp
+export CUDA_HOME=/usr/local/cuda-12.6
+export PATH="$CUDA_HOME/bin:$PATH"
+export LD_LIBRARY_PATH="$CUDA_HOME/lib64:$LD_LIBRARY_PATH"
 ```
 
-### Step 2. Create a conda environment
+Install the Jetson PyTorch wheel that matches the JetPack/L4T version. Do not
+install generic PyPI `torch` on Jetson for this project. After PyTorch is
+installed, install the remaining GraspNet runtime packages:
 
 ```bash
-conda create -n rebotarm python=3.10 -y
-conda activate rebotarm
+pip install -r requirements-graspnet-jetson.txt
 ```
 
-### Step 3. Install Python dependencies
+Build the GraspNet CUDA operators:
 
 ```bash
-pip install -r requirements.txt
+cd /home/seeed/Downloads/rebot_grasp/sdk/graspnet-baseline/pointnet2
+MAX_JOBS=1 python setup.py install
+
+cd /home/seeed/Downloads/rebot_grasp/sdk/graspnet-baseline/knn
+FORCE_CUDA=1 MAX_JOBS=1 python setup.py install
+
+cd /home/seeed/Downloads/rebot_grasp
 ```
 
-`requirements.txt` covers all dependencies for both the perception layer and the robotic arm control library:
+## Configuration
 
-```
-# perception / detection
-numpy<2.0.0
-scipy>=1.10
-opencv-python<4.10.0
-opencv-contrib-python<4.10.0
-ultralytics
-PyYAML>=6.0
-pyrealsense2>=2.54
+Main settings live in `config/default.yaml`.
 
-# robotic arm (reBotArm_control_py)
-pin>=3.9.0
-meshcat>=0.3.2
-matplotlib>=3.10.0
-motorbridge>=0.1.7
-```
-
-### Step 4. Install the robotic arm control library
-
-```bash
-git clone https://github.com/vectorBH6/reBotArm_control_py.git sdk/reBotArm_control_py
-cd sdk/reBotArm_control_py
-pip install -e .
-cd ../..
-```
-
-### Step 5. Install the Orbbec SDK (pyorbbecsdk)
-
-This project depends on **pyorbbecsdk** — the Python wrapper for Orbbec SDK v2 — but the repository does not bundle `sdk/pyorbbecsdk` by default. Please clone it yourself under `sdk/` first.
-
-**Option 1: Get it from GitHub (recommended)**
-
-```bash
-# Install build dependencies
-sudo apt-get install -y cmake build-essential libusb-1.0-0-dev
-
-cd sdk
-git clone https://github.com/orbbec/pyorbbecsdk.git
-cd pyorbbecsdk
-pip install -e .
-```
-
-**Option 2: Get it from Gitee**
-
-```bash
-cd sdk
-git clone https://gitee.com/orbbecdeveloper/pyorbbecsdk.git
-cd pyorbbecsdk
-pip install -e .
-```
-
-**Verify installation**
-
-```bash
-python -c "import pyorbbecsdk; print('pyorbbecsdk OK')"
-```
-
-**Configure udev rules (required on first use)**
-
-```bash
-cd sdk/pyorbbecsdk
-sudo bash scripts/install_udev_rules.sh
-sudo udevadm control --reload-rules && sudo udevadm trigger
-```
-
-**OrbbecViewer (optional — verify camera)**
-
-Download the prebuilt package and run `OrbbecViewer` to confirm the camera connection and depth stream are working before running the demo.
-
-- GitHub: https://github.com/orbbec/OrbbecSDK_v2/releases
-- Gitee: https://gitee.com/orbbecdeveloper/OrbbecSDK_v2/releases
-
-**SDK Resources**
-
-| Resource | Link |
-|----------|------|
-| Gemini 2 product page | https://www.orbbec.com/products/stereo-vision-camera/gemini-2/ |
-| All developer resources | https://www.orbbec.com.cn/index/Download2025/info.html?cate=121&id=1 |
-| Orbbec SDK v2 | https://github.com/orbbec/OrbbecSDK_v2 |
-| SDK v2 API guide | https://orbbec.github.io/docs/OrbbecSDKv2_API_User_Guide/ |
-| pyorbbecsdk | https://github.com/orbbec/pyorbbecsdk |
-| pyorbbecsdk docs | https://orbbec.github.io/pyorbbecsdk/index.html |
-| ROS2 Wrapper | https://github.com/orbbec/OrbbecSDK_ROS2/tree/v2-main |
-
----
-
-## 📁 Directory Structure
-
-```
-rebot_grasp/
-├── config/
-│   ├── default.yaml              # Main configuration
-│   └── calibration/
-│       └── orbbec_gemini2/
-│           ├── intrinsics.npz    # Camera intrinsics
-│           └── hand_eye.npz      # Hand-eye calibration result
-├── drivers/
-│   ├── camera/
-│   │   ├── base.py               # Abstract camera base class
-│   │   ├── orbbec_gemini2.py     # Gemini 2 driver
-│   │   └── realsense.py          # RealSense driver (alternative)
-│   └── robot/
-│       └── rebot_arm.py          # reBotArm wrapper + gripper FSM
-├── calibration/
-│   ├── aruco_pose.py             # ArUco pose estimation
-│   └── hand_eye.py               # Hand-eye calibration solver
-├── utils/
-│   ├── ordinary_grasp.py         # OBB grasp estimation and visualization
-│   └── transforms.py             # Coordinate transform utilities
-├── scripts/
-│   ├── main.py                   # Main grasping program
-│   ├── ordinary_grasp_pipeline.py
-│   ├── object_detection.py
-│   └── collect_handeye_eih.py
-├── sdk/
-│   ├── pyorbbecsdk/              # Orbbec SDK Python wrapper
-│   └── reBotArm_control_py/      # reBot Arm SDK
-└── requirements.txt
-```
-
----
-
-## 🛠️ Configuration
-
-### Config file
-
-Edit `config/default.yaml` and verify the key parameters:
+Important current values:
 
 ```yaml
 camera:
   type: orbbec_gemini2
   color_width: 1280
   color_height: 720
+  depth_width: 1280
+  depth_height: 720
   fps: 30
 
-robot:
-  repo_root: null   # auto-detects sdk/reBotArm_control_py
-  ready_pose:
-    x: 0.3
-    y: 0.0
-    z: 0.3
-    pitch: 1.0
-    duration: 3.0
-
 yolo:
-  model_name: "yoloe-26l-seg.pt"
-  device: "cpu"          # use "cuda:0" for GPU
-  custom_classes:
-    - "yellow banana"
-    - "water bottle"
-    - "cup"
+  model_name: "yolo11n-seg.engine"
+  device: "auto"
+  use_world: false
+  custom_classes: []
+
+graspnet:
+  checkpoint: "checkpoint-rs.tar"
 ```
 
-### Hand-eye calibration (first-time setup)
+Use `device: "auto"` for TensorRT engine inference. Open-vocabulary class lists
+are only useful for `.pt` world/YOLOE models, not for `.engine` files.
+
+## Verification
+
+Run these checks before attempting a real grasp.
+
+### 1. Verify Orbbec RGB-D stream
+
+Text-only check:
 
 ```bash
+python scripts/verify_pyorbbec_stream.py
+```
+
+Preview windows:
+
+```bash
+python scripts/verify_pyorbbec_stream.py --preview --seconds 10
+```
+
+No preview window is shown unless `--preview` is passed.
+
+### 2. Verify arm connection
+
+Read-only state check:
+
+```bash
+python scripts/verify_rebot_arm_motion.py --read-only
+```
+
+Small joint-6 jog and return:
+
+```bash
+python scripts/verify_rebot_arm_motion.py --deg 5
+```
+
+Only run the jog test with a clear robot workspace.
+
+### 3. Verify hand-eye calibration file
+
+```bash
+python scripts/verify_handeye_calibration.py
+```
+
+Expected result:
+
+```text
+[OK] hand-eye calibration looks usable
+```
+
+This checks that `hand_eye.npz` exists, is `eye_in_hand`, has at least 5 samples,
+and contains a valid rotation matrix.
+
+### 4. Verify GraspNet stack
+
+```bash
+python scripts/verify_graspnet_stack.py
+```
+
+Expected result:
+
+```text
+[OK] GraspNet stack is ready
+```
+
+If this reports missing `torch`, install a Jetson-matched PyTorch wheel. If it
+reports missing `pointnet2._ext` or `knn_pytorch`, rebuild the CUDA operators in
+`sdk/graspnet-baseline/pointnet2` and `sdk/graspnet-baseline/knn`.
+
+## Hand-Eye Calibration
+
+Redo calibration whenever the camera mount changes, the end-effector geometry
+changes, the marker size changes, or grasp poses are consistently shifted.
+
+### Automatic mode
+
+Use this first. The arm traverses preset viewpoints and records a sample when
+the marker is detected stably.
+
+```bash
+conda activate graspnet
+cd /home/seeed/Downloads/rebot_grasp
 python scripts/collect_handeye_eih.py
 ```
 
-In automatic mode, the arm traverses 50 preset poses and records a sample whenever the ArUco marker is detected stably. If the run finishes normally or is interrupted midway, the script still attempts to compute and save the calibration result; at least 5 samples are required, and 15 or more are recommended.
+Minimum samples: `5`. Recommended samples: `15+`. The automatic sequence has 50
+candidate poses. Press `c` or `q` to stop and compute from collected samples.
 
-If you want to move the arm by hand during calibration, use:
+The result is saved to:
+
+```text
+config/calibration/orbbec_gemini2/hand_eye.npz
+```
+
+Verify it:
+
+```bash
+python scripts/verify_handeye_calibration.py
+```
+
+### Manual gravity-compensation mode
+
+Use this if automatic poses do not see the marker reliably.
 
 ```bash
 python scripts/collect_handeye_eih.py --manual
 ```
 
-In manual mode, the arm enters gravity-compensation mode. Push the end effector to a suitable viewpoint, press `Enter` to capture, and use `c` or `q` to finish and compute the result.
+Controls:
 
----
+- `Enter`: capture one sample at the current pose.
+- `pos`: print current end-effector pose.
+- `c` or `q`: finish and compute calibration.
 
-## 🎬 Demo Description
+In manual mode, push the arm to different viewpoints around the fixed marker.
+Use varied roll, pitch, yaw, and distance. Avoid collecting many samples from
+nearly identical poses.
 
-### `scripts/main.py` — Main grasping program
+## Running Demos
 
-The full vision-grasping pipeline:
+### YOLO detection only
 
-1. Enable the arm and move to the ready pose
-2. Live camera preview with YOLO object detection and instance segmentation
-3. OBB short-axis estimation for gripper orientation; depth quantile for grasp height
-4. Press `G` to freeze the frame; hand-eye transform computes the target arm pose
-5. Arm moves to pre-grasp point → descends → gripper closes → lifts → returns to ready pose
+```bash
+python scripts/object_detection.py
+```
 
-### `scripts/ordinary_grasp_pipeline.py` — Simplified grasp test
+This verifies the `yolo11n-seg.engine` detector and camera display path.
 
-Runs OBB grasp pose estimation and visualization without connecting to the arm. Useful for debugging the perception module in isolation.
+### Ordinary OBB grasp perception
 
-### `scripts/object_detection.py` — Basic detection demo
+```bash
+python scripts/ordinary_grasp_pipeline.py
+```
 
-Pure YOLO detection with real-time bounding boxes and confidence scores. No grasping logic.
+This uses YOLO masks and depth to estimate a simple grasp point. It does not
+use GraspNet.
 
-### `scripts/collect_handeye_eih.py` — Hand-eye calibration data collection
+### GraspNet camera demo
 
-Eye-in-Hand hand-eye calibration using ArUco markers, with both automatic pose traversal and manual gravity-compensation sampling. Supports TSAI, PARK, and HORAUD solvers.
+Start with full-scene GraspNet, without YOLO target filtering:
 
----
+```bash
+python scripts/graspnet_camera_demo.py --camera-type orbbec_gemini2 --no-yolo --debug-frames
+```
 
-## 📄 References
+Then test target-aware mode with the TensorRT YOLO engine:
 
-- [reBotArm_control_py](https://github.com/vectorBH6/reBotArm_control_py) — Robotic arm control library
-- [reBot-DevArm](https://github.com/Seeed-Projects/reBot-DevArm) — reBot arm open-source project
-- [Orbbec Gemini 2](https://www.orbbec.com/products/stereo-vision-camera/gemini-2/)
-- [Orbbec SDK v2](https://github.com/orbbec/OrbbecSDK_v2)
-- [pyorbbecsdk](https://github.com/orbbec/pyorbbecsdk)
-- [Ultralytics YOLOv11](https://github.com/ultralytics/ultralytics)
+```bash
+python scripts/graspnet_camera_demo.py --camera-type orbbec_gemini2 --yolo-model yolo11n-seg.engine
+```
 
----
+Useful options:
 
-## ☎ Contact Us
+```bash
+--no-visualizer       Run without the Open3D window.
+--auto               Run inference periodically.
+--infer-interval 2   Set automatic inference interval in seconds.
+--target-class cup   Prefer a specific detected class.
+--no-yolo            Run full-scene GraspNet.
+```
 
-- **Technical Support**: [Submit an Issue](https://github.com/Seeed-Projects/reBot-DevArm-Grasp/issues)
+Keyboard controls in the visual demo:
 
----
+- `g` or `Space`: run GraspNet on the current RGB-D frame.
+- `q` or `Esc`: quit.
 
-<p align="center">
-  <strong>🌟 If this project helps you, please give us a Star!</strong>
-</p>
+## Robot Grasp Execution
+
+Always dry-run first.
+
+Full-scene GraspNet dry-run:
+
+```bash
+python scripts/grasp.py --dry-run --camera-type orbbec_gemini2 --no-yolo
+```
+
+Target-aware dry-run:
+
+```bash
+python scripts/grasp.py --dry-run --camera-type orbbec_gemini2 --target-class cup
+```
+
+If the printed target pose and preview look correct, remove `--dry-run`:
+
+```bash
+python scripts/grasp.py --camera-type orbbec_gemini2 --target-class cup
+```
+
+The script initializes the arm and gripper, moves to the configured ready pose,
+captures an RGB-D frame, estimates a grasp, transforms it through hand-eye
+calibration, and executes pre-grasp, descend, close, lift, and return motions.
+
+## Troubleshooting
+
+### `pyorbbecsdk import failed`
+
+Rebuild/install the local Orbbec SDK package:
+
+```bash
+cd /home/seeed/Downloads/rebot_grasp/sdk/pyorbbecsdk
+cmake --install build
+pip install --force-reinstall dist/pyorbbecsdk2-*.whl
+```
+
+Install udev rules:
+
+```bash
+cd /home/seeed/Downloads/rebot_grasp/sdk/pyorbbecsdk/scripts/env_setup
+sudo ./install_udev_rules.sh
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+### No camera window
+
+`verify_pyorbbec_stream.py` is text-only by default. Use:
+
+```bash
+python scripts/verify_pyorbbec_stream.py --preview
+```
+
+For headless GraspNet tests, use `--no-visualizer`.
+
+### `nvbufsurftransform: Could not get EGL display connection`
+
+This warning can appear on Jetson when a display/EGL session is not available.
+It is not fatal for text-only checks. For GUI preview, run from a local desktop
+session or use a proper X11/Wayland forwarding setup.
+
+### `torch.cuda.is_available()` is false
+
+The installed PyTorch is wrong for Jetson or CUDA is not visible. Install the
+NVIDIA Jetson PyTorch wheel matching the board's JetPack/L4T release, then
+check:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+### `No module named pointnet2._ext` or `knn_pytorch`
+
+Rebuild the GraspNet CUDA ops:
+
+```bash
+export CUDA_HOME=/usr/local/cuda-12.6
+export PATH="$CUDA_HOME/bin:$PATH"
+
+cd /home/seeed/Downloads/rebot_grasp/sdk/graspnet-baseline/pointnet2
+MAX_JOBS=1 python setup.py install
+
+cd /home/seeed/Downloads/rebot_grasp/sdk/graspnet-baseline/knn
+FORCE_CUDA=1 MAX_JOBS=1 python setup.py install
+```
+
+### ArUco marker is not detected
+
+Check:
+
+- The marker is ID `0` from `DICT_4X4_50`.
+- The measured marker edge length matches `marker_length_m`.
+- The marker is flat, well lit, and fully visible.
+- The camera intrinsics file exists at `config/calibration/orbbec_gemini2/intrinsics.npz`.
+
+## Main Files
+
+```text
+config/default.yaml                         Main runtime configuration
+models/yolo11n-seg.engine                   TensorRT YOLO segmentation engine
+config/calibration/orbbec_gemini2/          Camera intrinsics and hand-eye files
+scripts/verify_pyorbbec_stream.py           Orbbec RGB-D stream check
+scripts/verify_rebot_arm_motion.py          Arm read/jog check
+scripts/verify_handeye_calibration.py       Calibration file sanity check
+scripts/verify_graspnet_stack.py            GraspNet dependency check
+scripts/collect_handeye_eih.py              Eye-in-hand calibration collection
+scripts/graspnet_camera_demo.py             Camera-only GraspNet demo
+scripts/grasp.py                            Robot GraspNet execution
+```
+
+## References
+
+- Seeed wiki: https://wiki.seeedstudio.com/rebot_arm_b601_dm_grasping_demo/
+- reBot arm SDK: https://github.com/vectorBH6/reBotArm_control_py
+- Orbbec SDK v2: https://github.com/orbbec/OrbbecSDK_v2
+- pyorbbecsdk: https://github.com/orbbec/pyorbbecsdk
+- GraspNet baseline: https://github.com/graspnet/graspnet-baseline
+- GraspNet API: https://github.com/graspnet/graspnetAPI
+- NVIDIA PyTorch for Jetson: https://docs.nvidia.com/deeplearning/frameworks/install-pytorch-jetson-platform/index.html
