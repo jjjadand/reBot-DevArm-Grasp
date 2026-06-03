@@ -271,6 +271,39 @@ Keyboard controls in the visual demo:
 - `g` or `Space`: run GraspNet on the current RGB-D frame.
 - `q` or `Esc`: quit.
 
+### GraspNet web UI
+
+`scripts/grasp_web.py` combines the local web frontend and backend in one file.
+It streams the camera as MJPEG, lets you select a YOLO target class, and
+automatically overlays the current best GraspNet grasp point on the RGB frame.
+
+Preview only, no robot connection:
+
+```bash
+python scripts/grasp_web.py --host 0.0.0.0 --port 8000
+```
+
+Full-scene GraspNet without YOLO target filtering:
+
+```bash
+python scripts/grasp_web.py --host 0.0.0.0 --port 8000 --no-yolo
+```
+
+Allow real grasp execution from the web button:
+
+```bash
+python scripts/grasp_web.py --host 0.0.0.0 --port 8000 --enable-robot
+```
+
+Open the browser at:
+
+```text
+http://localhost:8000
+```
+
+Automatic updates only refresh the GraspNet grasp point. The robot only moves
+when `--enable-robot` is used and the `真实抓取` button is clicked.
+
 ## Robot Grasp Execution
 
 Always dry-run first.
@@ -380,6 +413,7 @@ scripts/verify_handeye_calibration.py       Calibration file sanity check
 scripts/verify_graspnet_stack.py            GraspNet dependency check
 scripts/collect_handeye_eih.py              Eye-in-hand calibration collection
 scripts/graspnet_camera_demo.py             Camera-only GraspNet demo
+scripts/grasp_web.py                        Web UI for GraspNet point preview/execution
 scripts/grasp.py                            Robot GraspNet execution
 ```
 

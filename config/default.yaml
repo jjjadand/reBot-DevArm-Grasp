@@ -45,3 +45,29 @@ grasp_pipeline:
   grasp:
     depth_quantile: 0.6
     pregrasp_offset_m: 0.080
+    grasp_forward_offset_m: 0.000
+    grasp_lateral_offset_m: 0.000
+    grasp_vertical_offset_m: 0.000
+    grasp_roll_offset_deg: 0.0
+    grasp_pitch_offset_deg: 0.0
+    grasp_yaw_offset_deg: 0.0
+    camera_x_offset_m: 0.000
+    camera_y_offset_m: 0.000
+    camera_z_offset_m: 0.000
+    camera_roll_offset_deg: 0.0
+    camera_pitch_offset_deg: 0.0
+    camera_yaw_offset_deg: 0.0
+    base_x_offset_m: 0.000
+    base_y_offset_m: 0.000
+    base_z_offset_m: 0.000
+    base_roll_offset_deg: 0.0
+    base_pitch_offset_deg: 0.0
+    base_yaw_offset_deg: 0.0
+  place:
+    enabled: true
+    base_joint: joint1
+    base_delta_deg: 90.0
+    base_direction: auto
+    base_rotate_duration: 2.5
+    base_safety_margin_deg: 5.0
+    return_home: true
