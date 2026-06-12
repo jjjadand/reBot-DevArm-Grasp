@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import signal
 import sys
 import threading
 import time
@@ -63,6 +64,7 @@ from utils.ordinary_grasp import (  # noqa: E402
     draw_grasp as draw_ordinary_grasp,
     estimate_grasps as estimate_ordinary_grasps,
 )
+from utils.transforms import rotation_matrix_to_euler_zyx  # noqa: E402
 from graspnetAPI.grasp import Grasp, GraspGroup  # noqa: E402
 
 
@@ -81,6 +83,27 @@ COCO80_NAMES = [
 ]
 
 
+def finite_float(payload: dict, key: str, default: float | None = None) -> float:
+    raw = payload.get(key, default)
+    if raw is None:
+        raise ValueError(f"{key} is required")
+    value = float(raw)
+    if not np.isfinite(value):
+        raise ValueError(f"{key} must be finite")
+    return value
+
+
+def pose_dict_from_matrix(T: np.ndarray) -> dict:
+    T = np.asarray(T, dtype=np.float64)
+    rpy = rotation_matrix_to_euler_zyx(T[:3, :3])
+    return {
+        "position_m": [round(float(v), 5) for v in T[:3, 3]],
+        "rpy_rad": [round(float(v), 6) for v in rpy],
+        "rpy_deg": [round(float(np.degrees(v)), 3) for v in rpy],
+        "matrix": [[round(float(v), 6) for v in row] for row in T.tolist()],
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Web target selector for GraspNet grasp-point preview")
     parser.add_argument("--host", default="127.0.0.1")
@@ -93,8 +116,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=None)
     parser.add_argument("--fps", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=20)
-    parser.add_argument("--num-point", type=int, default=20000)
+    parser.add_argument("--num-point", type=int, default=12000)
     parser.add_argument("--num-view", type=int, default=300)
+    parser.add_argument(
+        "--cloud-crop-nsample",
+        type=int,
+        default=32,
+        help="GraspNet CloudCrop samples per depth; lower values reduce CUDA memory",
+    )
     parser.add_argument("--collision-thresh", type=float, default=0.01)
     parser.add_argument("--voxel-size", type=float, default=0.01)
     parser.add_argument("--min-depth", type=float, default=0.05)
@@ -144,27 +173,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def detection_tags(target: DetectionTarget, selected: DetectionTarget | None) -> list[str]:
-    if selected is not None:
-        selected_key = (selected.result_index, selected.detection_index)
-        target_key = (target.result_index, target.detection_index)
-        if target_key == selected_key:
-            return ["target"]
-    return []
-
-
 def draw_detection_boxes(frame: np.ndarray, targets: list, selected, target_class: str | None) -> np.ndarray:
     display = frame.copy()
+    selected_key = None
+    if selected is not None:
+        selected_key = (selected.result_index, selected.detection_index)
+
     for target in targets:
-        tags = detection_tags(target, selected)
-        is_selected = "target" in tags
+        is_selected = selected_key == (target.result_index, target.detection_index)
         color = (0, 255, 80) if is_selected else (0, 185, 255)
         thickness = 3 if is_selected else 2
         x1, y1, x2, y2 = target.bbox_xyxy
         cv2.rectangle(display, (x1, y1), (x2, y2), color, thickness)
         label = f"{target.class_name} {target.conf:.2f}"
-        if tags:
-            label = f"{'/'.join(tags)} {label}"
+        if target_class and is_selected:
+            label = f"TARGET {label}"
         label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
         bg_y1 = max(0, y1 - label_size[1] - 8)
         cv2.rectangle(display, (x1, bg_y1), (x1 + label_size[0] + 8, y1), (0, 0, 0), -1)
@@ -234,12 +257,6 @@ def select_ordinary_target(grasps: list[GraspPose], target_class: str | None) ->
     if not candidates:
         return None
     return max(candidates, key=lambda grasp: grasp.conf)
-
-
-def ordinary_grasp_tags(grasp: GraspPose, selected: GraspPose | None) -> list[str]:
-    if selected is grasp:
-        return ["target"]
-    return []
 
 
 def _project_point(K: np.ndarray, xyz: np.ndarray) -> tuple[int, int] | None:
@@ -446,7 +463,7 @@ class GraspWebApp:
         self.class_names = self._class_names_from_yolo()
 
         self.status = "loading GraspNet..."
-        self.net = build_net(self.args.checkpoint, self.args.num_view)
+        self.net = build_net(self.args.checkpoint, self.args.num_view, self.args.cloud_crop_nsample)
         self.status = "GraspNet estimator ready"
 
         cam_cfg = self.cfg["camera"]
@@ -532,49 +549,6 @@ class GraspWebApp:
         _move_ready(self.robot, ready_cfg)
         self.ready_joints = self.robot.get_joint_positions().copy()
         print("[Web] robot connected, motors enabled, ready pose reached")
-
-    def prepare_grasp(self) -> dict:
-        if not self.args.enable_robot:
-            return {"ok": False, "error": "ready grasp disabled; restart with --enable-robot"}
-        if self.robot is None:
-            return {"ok": False, "error": "robot is not connected"}
-        if not self.infer_lock.acquire(blocking=False):
-            return {"ok": False, "error": "robot or grasp estimator is busy"}
-
-        self.busy = True
-        self.status = "moving robot to ready grasp pose..."
-        try:
-            robot_cfg = self.cfg.get("robot", {})
-            ready_cfg = robot_cfg.get(
-                "ready_pose",
-                {"x": 0.25, "y": 0.0, "z": 0.35, "roll": 0.0, "pitch": 1.2, "yaw": 0.0, "duration": 3.0},
-            )
-            self.robot.open_gripper(distance_m=float(self.args.gripper_open_width))
-            _move_ready(self.robot, ready_cfg)
-            self.ready_joints = self.robot.get_joint_positions().copy()
-            with self.frame_lock:
-                self.last_grasps = None
-                self.last_best = None
-                self.last_grasp_info = None
-                self.last_ordinary_grasps = []
-                self.last_ordinary_best = None
-                self.last_ordinary_info = None
-                self.ordinary_status = "ready pose reached; waiting for YOLO"
-            self.pending_grasp_update.set()
-            self.status = "ready grasp pose active; grasp update queued"
-            return {
-                "ok": True,
-                "status": self.status,
-                "ready_joints_deg": [round(float(v), 2) for v in np.degrees(self.ready_joints).tolist()],
-                "grasp_update_queued": True,
-            }
-        except Exception as exc:
-            traceback.print_exc()
-            self.status = f"ready grasp failed: {exc}"
-            return {"ok": False, "error": str(exc)}
-        finally:
-            self.busy = False
-            self.infer_lock.release()
 
     def _class_names_from_yolo(self) -> list[str]:
         if self.yolo_model is None:
@@ -794,7 +768,6 @@ class GraspWebApp:
             best = self.last_best
             grasp_info = dict(self.last_grasp_info) if self.last_grasp_info is not None else None
             ordinary_grasps = list(self.last_ordinary_grasps)
-            ordinary_best = self.last_ordinary_best
             ordinary_info = dict(self.last_ordinary_info) if self.last_ordinary_info is not None else None
             target_status = self.target_status
             auto_enabled = not self.args.no_auto_graspnet
@@ -804,7 +777,7 @@ class GraspWebApp:
             display_base = draw_detection_boxes(color_bgr, targets, selected, self.target_class or None)
             if not self.args.no_ordinary_grasp:
                 for ordinary_grasp in ordinary_grasps:
-                    draw_ordinary_grasp(display_base, ordinary_grasp, tags=ordinary_grasp_tags(ordinary_grasp, ordinary_best))
+                    draw_ordinary_grasp(display_base, ordinary_grasp)
         mode = "BUSY" if self.busy else "LIVE"
         auto_text = f"auto grasp {interval:.1f}s" if auto_enabled else "auto grasp off"
         display = overlay_status(
@@ -827,8 +800,7 @@ class GraspWebApp:
             return {"ok": False, "error": f"unknown class: {class_name}"}
         self.target_class = class_name
         with self.frame_lock:
-            self.selected_target = select_target(self.last_targets, self.target_class or None)
-            self.target_status = target_status_text(self.selected_target, self.last_targets, self.target_class or None)
+            self.selected_target = None
             self.last_grasps = None
             self.last_best = None
             self.last_grasp_info = None
@@ -910,17 +882,17 @@ class GraspWebApp:
 
     def state(self) -> dict:
         with self.frame_lock:
-            detections = []
-            for target in self.last_targets:
-                tags = detection_tags(target, self.selected_target)
-                detections.append({
+            detections = [
+                {
                     "class_name": target.class_name,
                     "conf": round(float(target.conf), 4),
                     "bbox_xyxy": list(target.bbox_xyxy),
-                    "selected": "target" in tags,
-                    "tag": tags[0] if tags else "",
-                    "tags": tags,
-                })
+                    "selected": self.selected_target is not None
+                    and (target.result_index, target.detection_index)
+                    == (self.selected_target.result_index, self.selected_target.detection_index),
+                }
+                for target in self.last_targets
+            ]
         if self.robot is not None:
             robot_status = "connected/enabled; waiting for explicit real grasp command"
         elif self.args.enable_robot and self.T_hand_eye is None:
@@ -1430,6 +1402,341 @@ class GraspWebApp:
             self.busy = False
             self.infer_lock.release()
 
+    # ── 关节控制 API ──────────────────────────────────────────────────────────
+
+    def robot_state(self) -> dict:
+        """GET /robot/state — 当前关节、末端位姿、夹爪状态。"""
+        if self.robot is None:
+            return {"ok": False, "error": "robot not connected"}
+        try:
+            joints_rad = self.robot.get_joint_positions()
+            tcp = self.robot.get_tcp_pose()
+            result = {
+                "ok": True,
+                "joint_names": list(self.robot._arm.joint_names),
+                "joints_rad": [round(float(v), 6) for v in joints_rad],
+                "joints_deg": [round(float(np.degrees(v)), 3) for v in joints_rad],
+                "end_effector": pose_dict_from_matrix(tcp),
+            }
+            if self.robot.has_gripper:
+                pos, vel, torq = self.robot.get_gripper_state()
+                result["gripper"] = {
+                    "pos_rad": round(float(pos), 6),
+                    "pos_deg": round(float(np.degrees(pos)), 3),
+                    "vel_rad_s": round(float(vel), 6),
+                    "torque_nm": round(float(torq), 6),
+                    "holding": bool(self.robot.gripper_is_holding),
+                }
+            return result
+        except Exception as exc:
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc)}
+
+    def get_joint_limits(self, payload: dict | None = None) -> dict:
+        """GET /joint/limits — 返回所有 6 个关节的当前角度和限位。"""
+        if self.robot is None:
+            return {"ok": False, "error": "robot not connected"}
+        try:
+            q_now = self.robot.get_joint_positions()
+            joints = []
+            for jname in self.robot._arm.joint_names:
+                idx = self.robot._joint_index(jname)
+                lo, hi = self.robot._joint_limit(jname)
+                joints.append({
+                    "name": jname,
+                    "current_rad": round(float(q_now[idx]), 6),
+                    "current_deg": round(float(np.degrees(q_now[idx])), 3),
+                    "limit_lo_rad": round(float(lo), 6),
+                    "limit_hi_rad": round(float(hi), 6),
+                    "limit_lo_deg": round(float(np.degrees(lo)), 3),
+                    "limit_hi_deg": round(float(np.degrees(hi)), 3),
+                })
+            return {"ok": True, "joints": joints}
+        except Exception as exc:
+            traceback.print_exc()
+            return {"ok": False, "error": str(exc)}
+
+    def gripper_control(self, payload: dict) -> dict:
+        """POST /gripper — 控制夹爪张开/闭合/释放/状态"""
+        if not self.args.enable_robot:
+            return {"ok": False, "error": "gripper control disabled; restart with --enable-robot"}
+        if self.robot is None:
+            return {"ok": False, "error": "robot is not connected"}
+
+        action = str(payload.get("action", "")).lower()
+
+        if action in ("", "state"):
+            if not self.robot.has_gripper:
+                return {"ok": False, "error": "robot has no gripper"}
+            pos, vel, torq = self.robot.get_gripper_state()
+            return {
+                "ok": True,
+                "has_gripper": self.robot.has_gripper,
+                "pos_rad": round(float(pos), 6),
+                "pos_deg": round(float(np.degrees(pos)), 3),
+                "vel_rad_s": round(float(vel), 6),
+                "torque_nm": round(float(torq), 6),
+                "holding": bool(self.robot.gripper_is_holding),
+            }
+
+        if action == "open":
+            dist = float(payload.get("distance_m", self.args.gripper_open_width))
+            self.robot.open_gripper(distance_m=dist)
+            return {"ok": True, "action": "open", "distance_m": dist}
+
+        if action == "close":
+            self.robot.close_gripper()
+            return {"ok": True, "action": "close"}
+
+        if action == "release":
+            self.robot.release_gripper()
+            return {"ok": True, "action": "release"}
+
+        valid = ["state", "open", "close", "release"]
+        return {"ok": False, "error": f"action must be one of: {valid}"}
+
+    def reset_robot(self, payload: dict | None = None) -> dict:
+        """POST /reset — 停止当前动作、释放夹爪、机械臂回零位。"""
+        if not self.args.enable_robot:
+            return {"ok": False, "error": "robot reset disabled; restart with --enable-robot"}
+        if self.robot is None:
+            return {"ok": False, "error": "robot is not connected"}
+        acquired = self.infer_lock.acquire(timeout=2.0)
+        if not acquired:
+            return {"ok": False, "error": "robot is busy; try again shortly"}
+        try:
+            self.execute_requested.clear()
+            self.busy = False
+            self.robot.release_gripper()
+            self.robot.safe_home()
+            self.ready_joints = self.robot.get_joint_positions().copy()
+            self.status = "robot reset complete"
+            return {"ok": True, "status": "reset complete, released gripper and returned home"}
+        except Exception as exc:
+            traceback.print_exc()
+            self.status = f"reset failed: {exc}"
+            return {"ok": False, "error": str(exc)}
+        finally:
+            if acquired:
+                self.infer_lock.release()
+
+    def move_to_ready(self, payload: dict | None = None) -> dict:
+        """POST /ready — 张开夹爪、移动机械臂到就绪位。"""
+        if not self.args.enable_robot:
+            return {"ok": False, "error": "robot ready disabled; restart with --enable-robot"}
+        if self.robot is None:
+            return {"ok": False, "error": "robot is not connected"}
+        acquired = self.infer_lock.acquire(timeout=2.0)
+        if not acquired:
+            return {"ok": False, "error": "robot is busy; try again shortly"}
+        self.busy = True
+        try:
+            self.status = "moving to ready pose..."
+            self.robot.open_gripper(distance_m=float(self.args.gripper_open_width))
+            robot_cfg = self.cfg.get("robot", {})
+            ready_cfg = robot_cfg.get(
+                "ready_pose",
+                {"x": 0.25, "y": 0.0, "z": 0.35, "roll": 0.0, "pitch": 1.2, "yaw": 0.0, "duration": 3.0},
+            )
+            from graspnetAPI.graspnet_app import _move_ready
+            _move_ready(self.robot, ready_cfg)
+            self.ready_joints = self.robot.get_joint_positions().copy()
+            self.status = "ready pose reached"
+            return {"ok": True, "status": "ready pose reached", "ready_pose": ready_cfg}
+        except Exception as exc:
+            traceback.print_exc()
+            self.status = f"ready pose failed: {exc}"
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self.busy = False
+            if acquired:
+                self.infer_lock.release()
+
+    def jog_joint(self, payload: dict) -> dict:
+        """POST /joint/jog — 相对转动任意关节（替代 /base_jog）"""
+        if not self.args.enable_robot:
+            return {"ok": False, "error": "robot jog disabled; restart with --enable-robot"}
+        if self.robot is None:
+            return {"ok": False, "error": "robot is not connected"}
+        if not self.infer_lock.acquire(blocking=False):
+            return {"ok": False, "error": "robot or grasp estimator is busy"}
+
+        self.busy = True
+        try:
+            joint_name = str(payload.get("joint", "joint1"))
+            delta_deg = float(payload.get("delta_deg", 0.0))
+            duration = float(payload.get("duration_s", 2.5))
+            margin_deg = float(payload.get("safety_margin_deg", 5.0))
+
+            if not np.isfinite(delta_deg) or not np.isfinite(duration) or not np.isfinite(margin_deg):
+                return {"ok": False, "error": "delta_deg, duration_s, safety_margin_deg must be finite"}
+            if abs(delta_deg) < 1e-6:
+                return {"ok": False, "error": "delta_deg must be non-zero"}
+            if abs(delta_deg) > 180.0:
+                return {"ok": False, "error": "delta_deg must be between -180 and 180"}
+            if duration <= 0.0:
+                return {"ok": False, "error": "duration_s must be positive"}
+            if margin_deg < 0.0:
+                return {"ok": False, "error": "safety_margin_deg must be non-negative"}
+
+            idx = self.robot._joint_index(joint_name)
+            lo, hi = self.robot._joint_limit(joint_name)
+            before = self.robot.get_joint_positions()
+            before_deg = float(np.degrees(before[idx]))
+            direction = "negative" if delta_deg < 0.0 else "positive"
+            ok = self.robot.rotate_base_relative(
+                np.radians(abs(delta_deg)),
+                duration=duration,
+                direction=direction,
+                safety_margin_rad=np.radians(margin_deg),
+                joint_name=joint_name,
+            )
+            after = self.robot.get_joint_positions()
+            after_deg = float(np.degrees(after[idx]))
+            status = (
+                f"joint jog {joint_name} {delta_deg:+.1f}deg completed"
+                if ok
+                else f"joint jog {joint_name} {delta_deg:+.1f}deg blocked or timed out"
+            )
+            self.status = status
+            return {
+                "ok": bool(ok),
+                "status": status,
+                "joint": joint_name,
+                "direction": direction,
+                "delta_deg": round(delta_deg, 3),
+                "duration_s": round(duration, 3),
+                "safety_margin_deg": round(margin_deg, 3),
+                "before_deg": round(before_deg, 3),
+                "after_deg": round(after_deg, 3),
+                "limit_deg": [round(float(np.degrees(lo)), 3), round(float(np.degrees(hi)), 3)],
+                "safe_limit_deg": [
+                    round(float(np.degrees(lo) + margin_deg), 3),
+                    round(float(np.degrees(hi) - margin_deg), 3),
+                ],
+            }
+        except Exception as exc:
+            traceback.print_exc()
+            self.status = f"joint jog failed: {exc}"
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self.busy = False
+            self.infer_lock.release()
+
+    def move_pose(self, payload: dict) -> dict:
+        """POST /move/pose — 末端位姿轨迹规划/IK 运动。"""
+        if not self.args.enable_robot:
+            return {"ok": False, "error": "robot move disabled; restart with --enable-robot"}
+        if self.robot is None:
+            return {"ok": False, "error": "robot is not connected"}
+        if self.robot._endpos_ctrl is None:
+            return {"ok": False, "error": "robot endpos controller not initialized"}
+        if not self.infer_lock.acquire(blocking=False):
+            return {"ok": False, "error": "robot or grasp estimator is busy"}
+
+        self.busy = True
+        try:
+            x = finite_float(payload, "x")
+            y = finite_float(payload, "y")
+            z = finite_float(payload, "z")
+            roll = finite_float(payload, "roll", 0.0)
+            pitch = finite_float(payload, "pitch", 0.0)
+            yaw = finite_float(payload, "yaw", 0.0)
+            duration = finite_float(payload, "duration_s", payload.get("duration", 3.0))
+            mode = str(payload.get("mode", "traj") or "traj").strip().lower()
+            if mode not in {"traj", "ik"}:
+                return {"ok": False, "error": "mode must be 'traj' or 'ik'"}
+            if duration <= 0.0:
+                return {"ok": False, "error": "duration_s must be positive"}
+
+            before = self.robot_state()
+            if not before.get("ok"):
+                return before
+
+            if mode == "traj":
+                ok = self.robot.move_to(x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw, duration=duration)
+                self.robot.wait_motion(duration)
+            else:
+                ok = bool(self.robot._endpos_ctrl.move_to_ik(x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw))
+                self.robot.wait_motion(duration, extra=0.2)
+
+            after = self.robot_state()
+            status = f"move_pose {mode} {'completed' if ok else 'failed'}"
+            self.status = status
+            return {
+                "ok": bool(ok),
+                "status": status,
+                "mode": mode,
+                "target": {
+                    "position_m": [round(x, 5), round(y, 5), round(z, 5)],
+                    "rpy_rad": [round(roll, 6), round(pitch, 6), round(yaw, 6)],
+                },
+                "duration_s": round(duration, 3),
+                "before": before,
+                "after": after,
+            }
+        except Exception as exc:
+            traceback.print_exc()
+            self.status = f"move_pose failed: {exc}"
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self.busy = False
+            self.infer_lock.release()
+
+    def move_joints(self, payload: dict) -> dict:
+        """POST /joint/move or /move/joints — 一次性设置所有关节的绝对位置。"""
+        if not self.args.enable_robot:
+            return {"ok": False, "error": "robot move disabled; restart with --enable-robot"}
+        if self.robot is None:
+            return {"ok": False, "error": "robot is not connected"}
+        if not self.infer_lock.acquire(blocking=False):
+            return {"ok": False, "error": "robot or grasp estimator is busy"}
+
+        self.busy = True
+        try:
+            if payload.get("joints_rad") is not None:
+                joints_rad = np.array(payload.get("joints_rad"), dtype=np.float64).reshape(-1)
+            elif payload.get("joints_deg") is not None:
+                joints_rad = np.radians(np.array(payload.get("joints_deg"), dtype=np.float64).reshape(-1))
+            else:
+                return {"ok": False, "error": "joints_rad or joints_deg is required"}
+
+            q_now = self.robot.get_joint_positions()
+            if joints_rad.shape != q_now.shape:
+                return {
+                    "ok": False,
+                    "error": f"expected {q_now.size} joint values, got {joints_rad.reshape(-1).size}",
+                }
+            if not np.all(np.isfinite(joints_rad)):
+                return {"ok": False, "error": "all joint values must be finite"}
+            duration = finite_float(payload, "duration_s", payload.get("duration", 3.0))
+            if duration <= 0.0:
+                return {"ok": False, "error": "duration_s must be positive"}
+
+            before = self.robot_state()
+            if not before.get("ok"):
+                return before
+            ok = self.robot.move_joints_to(joints_rad, duration=duration)
+            after = self.robot_state()
+            status = f"joints move {'completed' if ok else 'blocked or timed out'}"
+            self.status = status
+            return {
+                "ok": bool(ok),
+                "status": status,
+                "target_joints_rad": [round(float(v), 6) for v in joints_rad],
+                "target_joints_deg": [round(float(np.degrees(v)), 3) for v in joints_rad],
+                "duration_s": round(duration, 3),
+                "before": before,
+                "after": after,
+            }
+        except Exception as exc:
+            traceback.print_exc()
+            self.status = f"joints move failed: {exc}"
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self.busy = False
+            self.infer_lock.release()
+
 
 INDEX_TEMPLATE = """<!doctype html>
 <html lang="zh-CN">
@@ -1469,7 +1776,6 @@ INDEX_TEMPLATE = """<!doctype html>
     <button id="setTarget" data-i18n="setTarget">设置目标</button>
     <button id="infer" data-i18n="refreshGrasp">刷新抓取点</button>
     <button id="grasp" class="danger" data-i18n="realGrasp">真实抓取</button>
-    <button id="readyPose" class="secondary" data-i18n="readyGrasp">预备抓取</button>
     <span class="muted" id="modeHint" data-i18n="modeHintInitial">自动显示 ordinary 抓取点；真实抓取需用 --enable-robot 启动</span>
   </header>
   <main>
@@ -1518,18 +1824,45 @@ INDEX_TEMPLATE = """<!doctype html>
         </div>
       </section>
       <section class="controls">
-        <div class="control-title" data-i18n="baseJogTitle">底座电机调试</div>
+        <div class="control-title">关节调试</div>
         <div class="control-row">
-          <label data-i18n="baseJogDegLabel">joint1 jog(°)</label>
-          <input id="baseJogDeg" type="number" min="-180" max="180" step="1" value="-30" title="底座电机 joint1 相对角度；负数走负方向" data-i18n-title="baseJogDegTitle">
-          <input id="baseJogDuration" type="number" min="0.2" max="10" step="0.1" value="2.5" title="底座电机运动时长，单位秒" data-i18n-title="baseJogDurationTitle">
-          <input id="baseJogMargin" type="number" min="0" max="45" step="0.5" value="5.0" title="joint1 限位安全边距，单位度" data-i18n-title="baseJogMarginTitle">
+          <label>选择关节</label>
+          <select id="jogJointSelect">
+            <option value="joint1">joint1 (底座)</option>
+            <option value="joint2">joint2 (肩)</option>
+            <option value="joint3">joint3 (大臂)</option>
+            <option value="joint4">joint4 (小臂)</option>
+            <option value="joint5">joint5 (腕)</option>
+            <option value="joint6">joint6 (腕转)</option>
+          </select>
+          <button id="btnJointLimits">读取限位</button>
+        </div>
+        <div class="control-row">
+          <label>相对角度(°)</label>
+          <input id="jogDeg" type="number" min="-180" max="180" step="1" value="-10">
+          <label>时长(s)</label>
+          <input id="jogDuration" type="number" min="0.2" max="10" step="0.1" value="2.5">
+          <label>安全边距(°)</label>
+          <input id="jogMargin" type="number" min="0" max="45" step="0.5" value="5.0">
         </div>
         <div class="control-actions">
-          <button id="baseJogNeg">-30°</button>
-          <button id="baseJogApply" data-i18n="baseJogApply">执行底座jog</button>
-          <button id="baseJogPos">+30°</button>
+          <button id="jogNeg">-30°</button>
+          <button id="jogApply">执行 jog</button>
+          <button id="jogPos">+30°</button>
         </div>
+        <div class="control-row" style="margin-top:8px;">
+          <label>绝对位置(弧度，6个关节)</label>
+          <input id="moveJ1" type="number" step="0.01" placeholder="j1" style="width:70px;">
+          <input id="moveJ2" type="number" step="0.01" placeholder="j2" style="width:70px;">
+          <input id="moveJ3" type="number" step="0.01" placeholder="j3" style="width:70px;">
+          <input id="moveJ4" type="number" step="0.01" placeholder="j4" style="width:70px;">
+          <input id="moveJ5" type="number" step="0.01" placeholder="j5" style="width:70px;">
+          <input id="moveJ6" type="number" step="0.01" placeholder="j6" style="width:70px;">
+          <label>时长(s)</label>
+          <input id="moveDuration" type="number" min="0.2" max="15" step="0.1" value="3.0" style="width:60px;">
+          <button id="btnMoveJoints">移动全部关节</button>
+        </div>
+        <div id="jointLimitsDisplay" style="font-size:11px; color:#8ab; margin-top:4px; min-height:18px;"></div>
       </section>
       <div class="status" id="status" data-i18n="loading">loading...</div>
       <pre id="state"></pre>
@@ -1544,7 +1877,6 @@ INDEX_TEMPLATE = """<!doctype html>
         setTarget: '设置目标',
         refreshGrasp: '刷新抓取点',
         realGrasp: '真实抓取',
-        readyGrasp: '预备抓取',
         modeHintInitial: '自动显示 ordinary 抓取点；真实抓取需用 --enable-robot 启动',
         modeHintConnected: '自动更新 ordinary 抓取点；点击真实抓取会优先执行当前 ordinary 抓取点',
         modeHintDisconnected: '自动更新 ordinary 抓取点；真实抓取需重启脚本并加 --enable-robot',
@@ -1602,7 +1934,6 @@ INDEX_TEMPLATE = """<!doctype html>
         setTarget: 'Set target',
         refreshGrasp: 'Refresh grasp',
         realGrasp: 'Real grasp',
-        readyGrasp: 'Prepare grasp',
         modeHintInitial: 'Ordinary grasp points update automatically; start with --enable-robot for real grasp.',
         modeHintConnected: 'Ordinary grasp points update automatically; Real grasp uses the current ordinary grasp first.',
         modeHintDisconnected: 'Ordinary grasp points update automatically; restart with --enable-robot for real grasp.',
@@ -1664,16 +1995,27 @@ INDEX_TEMPLATE = """<!doctype html>
     const stateEl = document.getElementById('state');
     const inferBtn = document.getElementById('infer');
     const graspBtn = document.getElementById('grasp');
-    const readyBtn = document.getElementById('readyPose');
     const modeHint = document.getElementById('modeHint');
-    const baseJogDeg = document.getElementById('baseJogDeg');
-    const baseJogDuration = document.getElementById('baseJogDuration');
-    const baseJogMargin = document.getElementById('baseJogMargin');
-    const baseJogButtons = [
-      document.getElementById('baseJogNeg'),
-      document.getElementById('baseJogApply'),
-      document.getElementById('baseJogPos')
+    const jogJointSelect = document.getElementById('jogJointSelect');
+    const jogDeg = document.getElementById('jogDeg');
+    const jogDuration = document.getElementById('jogDuration');
+    const jogMargin = document.getElementById('jogMargin');
+    const jogNegBtn = document.getElementById('jogNeg');
+    const jogApplyBtn = document.getElementById('jogApply');
+    const jogPosBtn = document.getElementById('jogPos');
+    const jointLimitsDisplay = document.getElementById('jointLimitsDisplay');
+    const moveJoints = [
+      document.getElementById('moveJ1'),
+      document.getElementById('moveJ2'),
+      document.getElementById('moveJ3'),
+      document.getElementById('moveJ4'),
+      document.getElementById('moveJ5'),
+      document.getElementById('moveJ6'),
     ];
+    const moveDuration = document.getElementById('moveDuration');
+    const btnMoveJoints = document.getElementById('btnMoveJoints');
+    const btnJointLimits = document.getElementById('btnJointLimits');
+    const robotMotionButtons = [jogNegBtn, jogApplyBtn, jogPosBtn, btnMoveJoints, btnJointLimits];
     const compensationInputs = {{
       forward_m: {{ el: document.getElementById('forwardOffset'), digits: 3 }},
       lateral_m: {{ el: document.getElementById('lateralOffset'), digits: 3 }},
@@ -1697,7 +2039,6 @@ INDEX_TEMPLATE = """<!doctype html>
     let compensationDirty = false;
     let inferRequestInFlight = false;
     let graspRequestInFlight = false;
-    let readyRequestInFlight = false;
 
     function tr(key) {{
       return (I18N[currentLang] && I18N[currentLang][key]) || I18N.zh[key] || key;
@@ -1818,35 +2159,82 @@ INDEX_TEMPLATE = """<!doctype html>
         statusEl.textContent = tr('errorPrefix') + e.message;
       }}
     }};
-    async function jogBase(deltaOverride) {{
+    async function jogJoint(deltaOverride) {{
       try {{
-        const delta = deltaOverride === undefined ? readNumberInput(baseJogDeg, 'joint1 jog') : deltaOverride;
+        const joint = jogJointSelect.value;
+        const delta = deltaOverride === undefined ? readNumberInput(jogDeg, 'jog delta') : deltaOverride;
         const payload = {{
+          joint: joint,
           delta_deg: delta,
-          duration_s: readNumberInput(baseJogDuration, tr('baseJogDurationName')),
-          safety_margin_deg: readNumberInput(baseJogMargin, tr('baseJogMarginName'))
+          duration_s: readNumberInput(jogDuration, 'jog duration'),
+          safety_margin_deg: readNumberInput(jogMargin, 'jog margin')
         }};
-        const data = await post('/base_jog', payload);
+        const data = await post('/joint/jog', payload);
         if (data.ok) {{
-          baseJogDeg.value = Number(data.delta_deg || delta).toFixed(1);
+          jogDeg.value = Number(data.delta_deg || delta).toFixed(1);
+          statusEl.textContent = data.status || 'ok';
+          // refresh joint limits display
+          fetchJointLimits();
         }}
       }} catch (e) {{
         statusEl.textContent = tr('errorPrefix') + e.message;
       }}
     }}
-    document.getElementById('baseJogNeg').onclick = () => {{
+    jogNegBtn.onclick = () => {{
       try {{
-        const step = Math.abs(readNumberInput(baseJogDeg, 'joint1 jog') || 30);
-        jogBase(-step);
+        const step = Math.abs(readNumberInput(jogDeg, 'jog delta') || 30);
+        jogJoint(-step);
       }} catch (e) {{
         statusEl.textContent = tr('errorPrefix') + e.message;
       }}
     }};
-    document.getElementById('baseJogApply').onclick = () => jogBase();
-    document.getElementById('baseJogPos').onclick = () => {{
+    jogApplyBtn.onclick = () => jogJoint();
+    jogPosBtn.onclick = () => {{
       try {{
-        const step = Math.abs(readNumberInput(baseJogDeg, 'joint1 jog') || 30);
-        jogBase(step);
+        const step = Math.abs(readNumberInput(jogDeg, 'jog delta') || 30);
+        jogJoint(step);
+      }} catch (e) {{
+        statusEl.textContent = tr('errorPrefix') + e.message;
+      }}
+    }};
+
+    async function fetchJointLimits() {{
+      try {{
+        const res = await fetch('/joint/limits');
+        const data = await res.json();
+        if (data.ok && data.joints) {{
+          const lines = data.joints.map(j =>
+            `${{j.name}}: ${{j.current_deg.toFixed(1)}}° [${{j.limit_lo_deg.toFixed(1)}}°, ${{j.limit_hi_deg.toFixed(1)}}°]`
+          );
+          jointLimitsDisplay.textContent = lines.join(' | ');
+        }}
+      }} catch (e) {{
+        jointLimitsDisplay.textContent = '';
+      }}
+    }}
+    btnJointLimits.onclick = () => fetchJointLimits();
+
+    btnMoveJoints.onclick = async () => {{
+      try {{
+        const vals = moveJoints.map(el => el.value.trim());
+        // Only include non-empty values
+        if (vals.every(v => v === '')) {{
+          statusEl.textContent = '请至少填入一个关节的绝对位置（弧度）';
+          return;
+        }}
+        const res = await fetch('/joint/limits');
+        const limitsData = await res.json();
+        if (!limitsData.ok) {{
+          statusEl.textContent = '无法读取关节限位';
+          return;
+        }}
+        const joints_rad = limitsData.joints.map((j, i) => {{
+          return vals[i] !== '' ? parseFloat(vals[i]) : limitsData.joints[i].current_deg * Math.PI / 180;
+        }});
+        const dur = readNumberInput(moveDuration, 'move duration');
+        const payload = {{ joints_rad, duration_s: dur }};
+        const data = await post('/joint/move', payload);
+        statusEl.textContent = data.status || (data.ok ? '关节移动中' : data.error);
       }} catch (e) {{
         statusEl.textContent = tr('errorPrefix') + e.message;
       }}
@@ -1860,15 +2248,6 @@ INDEX_TEMPLATE = """<!doctype html>
         await post('/grasp');
       }} finally {{
         graspRequestInFlight = false;
-      }}
-    }};
-    readyBtn.onclick = async () => {{
-      readyRequestInFlight = true;
-      readyBtn.disabled = true;
-      try {{
-        await post('/ready');
-      }} finally {{
-        readyRequestInFlight = false;
       }}
     }};
 
@@ -1889,9 +2268,8 @@ INDEX_TEMPLATE = """<!doctype html>
         statusEl.textContent = autoText + ' | ' + ordinaryText + ' | ' + robotText + ' | ' + data.status + ' | ' + data.target_status;
         inferBtn.disabled = data.busy || inferRequestInFlight;
         graspBtn.disabled = !data.robot_connected || graspRequestInFlight;
-        readyBtn.disabled = !data.robot_connected || data.busy || readyRequestInFlight || graspRequestInFlight;
-        for (const btn of baseJogButtons) {{
-          btn.disabled = !data.robot_connected || data.busy || graspRequestInFlight || readyRequestInFlight;
+        for (const btn of robotMotionButtons) {{
+          btn.disabled = !data.robot_connected || data.busy || graspRequestInFlight;
         }}
         updateModeHint(data.robot_connected);
         stateEl.textContent = JSON.stringify(data, null, 2);
@@ -1916,6 +2294,10 @@ class GraspWebHandler(BaseHTTPRequestHandler):
             self._send_html(self._index_html())
         elif path == "/state":
             self._send_json(self.app.state())
+        elif path == "/robot/state":
+            self._send_json(self.app.robot_state())
+        elif path == "/joint/limits":
+            self._send_json(self.app.get_joint_limits())
         elif path == "/stream.mjpg":
             self._stream_mjpeg()
         else:
@@ -1933,10 +2315,22 @@ class GraspWebHandler(BaseHTTPRequestHandler):
             self._send_json(self.app.set_forward_offset(float(payload.get("offset_m", 0.0))))
         elif path == "/base_jog":
             self._send_json(self.app.jog_base(self._read_payload()))
-        elif path == "/ready":
-            self._send_json(self.app.prepare_grasp())
-        elif path == "/infer":
+        elif path == "/joint/limits":
+            self._send_json(self.app.get_joint_limits(self._read_payload()))
+        elif path == "/joint/jog":
+            self._send_json(self.app.jog_joint(self._read_payload()))
+        elif path == "/move/pose":
+            self._send_json(self.app.move_pose(self._read_payload()))
+        elif path in {"/joint/move", "/move/joints"}:
+            self._send_json(self.app.move_joints(self._read_payload()))
+        elif path in {"/infer", "/start"}:
             self._send_json(self.app.run_grasp(execute=False))
+        elif path == "/reset":
+            self._send_json(self.app.reset_robot(self._read_payload()))
+        elif path == "/ready":
+            self._send_json(self.app.move_to_ready(self._read_payload()))
+        elif path == "/gripper":
+            self._send_json(self.app.gripper_control(self._read_payload()))
         elif path == "/grasp":
             self._send_json(self.app.execute_latest_grasp())
         else:
@@ -2005,6 +2399,12 @@ def main() -> int:
     args = parse_args()
     app = GraspWebApp(args)
     app.start()
+
+    def request_shutdown(signum, _frame) -> None:
+        print(f"\n[Web] received signal {signum}; stopping...")
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, request_shutdown)
 
     handler_cls = type("BoundGraspWebHandler", (GraspWebHandler,), {"app": app})
     server = ThreadingHTTPServer((args.host, args.port), handler_cls)

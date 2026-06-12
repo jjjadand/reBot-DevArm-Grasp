@@ -32,6 +32,9 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 import open3d as o3d
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:64")
+
 import torch
 import yaml
 
@@ -279,6 +282,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug-frames", action="store_true", help="print first RGB-D frame statistics")
     parser.add_argument("--num-point", type=int, default=20000)
     parser.add_argument("--num-view", type=int, default=300)
+    parser.add_argument(
+        "--cloud-crop-nsample",
+        type=int,
+        default=64,
+        help="GraspNet CloudCrop samples per depth; lower values reduce CUDA memory",
+    )
     parser.add_argument("--collision-thresh", type=float, default=0.01)
     parser.add_argument("--voxel-size", type=float, default=0.01)
     parser.add_argument("--min-depth", type=float, default=0.05, help="meters")
@@ -594,10 +603,35 @@ def draw_target_overlay(
     return display
 
 
-def build_net(checkpoint_path: str, num_view: int) -> GraspNet:
+def _empty_cuda_cache() -> None:
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+
+def set_cloud_crop_nsample(net: GraspNet, nsample: int) -> None:
+    nsample = int(nsample)
+    if nsample <= 0:
+        raise ValueError("--cloud-crop-nsample must be positive")
+    crop = net.grasp_generator.crop
+    old_nsample = int(crop.nsample)
+    if nsample == old_nsample:
+        return
+    crop.nsample = nsample
+    for grouper in crop.groupers:
+        grouper.nsample = nsample
+    print(f"Configured GraspNet CloudCrop nsample={nsample} (checkpoint default {old_nsample})")
+
+
+def build_net(checkpoint_path: str, num_view: int, cloud_crop_nsample: int = 64) -> GraspNet:
     if not torch.cuda.is_available():
         raise RuntimeError("GraspNet pointnet2 operators require CUDA, but torch.cuda is unavailable.")
 
+    _empty_cuda_cache()
     net = GraspNet(
         input_feature_dim=0,
         num_view=num_view,
@@ -613,6 +647,7 @@ def build_net(checkpoint_path: str, num_view: int) -> GraspNet:
 
     checkpoint = torch.load(checkpoint_path, map_location=device)
     net.load_state_dict(checkpoint["model_state_dict"])
+    set_cloud_crop_nsample(net, cloud_crop_nsample)
     net.eval()
     print(f"Loaded checkpoint {checkpoint_path} (epoch: {checkpoint['epoch']})")
     return net
@@ -717,11 +752,29 @@ def infer_grasps(
     K: Optional[np.ndarray] = None,
     target_margin_px: int = 0,
 ) -> tuple[GraspGroup, int, int]:
-    with torch.no_grad():
-        end_points = net(end_points)
-        grasp_preds = pred_decode(end_points)
+    try:
+        _empty_cuda_cache()
+        with torch.inference_mode():
+            end_points = net(end_points)
+            grasp_preds = pred_decode(end_points)
+            grasp_array = grasp_preds[0].detach().cpu().numpy().copy()
+    except RuntimeError as exc:
+        _empty_cuda_cache()
+        msg = str(exc)
+        oom_markers = ("out of memory", "CUDACachingAllocator", "NVML_SUCCESS", "NvMapMem")
+        if any(marker in msg for marker in oom_markers):
+            raise RuntimeError(
+                "GraspNet CUDA memory allocation failed. Restart grasp_web.py with lower "
+                "--num-point and --cloud-crop-nsample, for example --num-point 12000 "
+                "--cloud-crop-nsample 32."
+            ) from exc
+        raise
+    finally:
+        end_points = None
+        grasp_preds = None
+        _empty_cuda_cache()
 
-    gg = GraspGroup(grasp_preds[0].detach().cpu().numpy())
+    gg = GraspGroup(grasp_array)
     decoded_count = len(gg)
     target_count = decoded_count
     if target_mask is not None:
@@ -779,7 +832,7 @@ def main() -> None:
     cfg = configure_camera(cfg, args)
 
     yolo_model, yolo_opts = load_yolo(cfg, args)
-    net = build_net(args.checkpoint, args.num_view)
+    net = build_net(args.checkpoint, args.num_view, args.cloud_crop_nsample)
     cam_cfg = cfg["camera"]
     print(
         "Using camera: "
